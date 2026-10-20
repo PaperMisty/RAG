@@ -20,3 +20,5 @@ wheels/
 data/
 
 test/
+experiment
+.colab

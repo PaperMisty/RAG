@@ -96,6 +96,7 @@ class NodeAnswerOutput(NodeBase):
                 answer += res_delta.content
             q.put({"event": "final", "data": ""})
             data_dict["text"] = answer
+            data_dict["chunks"] = web_chunks
             insert_id = add_or_update_data(data_dict)
             logger.info(f"低置信度网络搜索总结信息已插入数据库, id:{insert_id}")
         # 置信度较高情况, 触发常规本地RAG回答
@@ -157,6 +158,7 @@ class NodeAnswerOutput(NodeBase):
                 answer += res_delta.content
             q.put({"event": "final", "data": ""})
             data_dict["text"] = answer
+            data_dict["chunks"] = local_chunks
             insert_id = add_or_update_data(data_dict)
             logger.info(f"answer输出信息已插入数据库, id:{insert_id}")
         return {"answer": answer}

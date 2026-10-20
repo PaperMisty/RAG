@@ -353,6 +353,11 @@ async function loadHistory() {
             if (item.role === 'user') {
                 addUserMsgWithTime(item.text || '', item.ts);
             } else {
+                if (Array.isArray(item.chunks)) {
+                    item.chunks.forEach(c => {
+                        currentSessionChunks[c.id] = c;
+                    });
+                }
                 addBotMsgWithTime(item.text || '', item.ts, item.image_urls || []);
             }
         }
@@ -776,7 +781,11 @@ const closeDrawerBtn = document.getElementById('closeDrawer');
 
 window.openSourceDrawer = function(chunkId) {
     const chunk = currentSessionChunks[chunkId];
-    if (!chunk) return;
+    if (!chunk) {
+        console.warn(`[openSourceDrawer] 未在缓存中找到标号 [${chunkId}] 的切片信息。当前已缓存的切片 ID:`, Object.keys(currentSessionChunks));
+        alert(`未在本地缓存中找到标号 [${chunkId}] 对应的原文切片（该消息可能产生于持久化支持添加前，重新提问即可查看最新切片详情）。`);
+        return;
+    }
 
     document.getElementById('drawerFileTitle').textContent = chunk.file_title || '未知来源';
     document.getElementById('drawerSectionTitle').textContent = chunk.section_title || '正文小节';

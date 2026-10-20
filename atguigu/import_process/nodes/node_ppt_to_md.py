@@ -13,10 +13,15 @@ import zipfile
 from datetime import timedelta
 from pathlib import Path
 
-import pythoncom
+try:
+    import pythoncom
+    import win32com.client
+except ImportError:
+    pythoncom = None
+    win32com = None
+
 import requests
 import urllib3
-import win32com.client
 from PIL import Image
 
 from atguigu.config.config import MinIOConfig, MineruConfig, OUTPUT_DIR, RAW_DIR
@@ -150,6 +155,8 @@ class NodePPTToMD(NodeBase):
 
     def _export_ppt_to_images(self, ppt_path: Path, output_dir: Path) -> None:
         """调用 Windows PowerPoint/WPS 导出 PPT 为 JPG 图片"""
+        if pythoncom is None or win32com is None:
+            raise NotImplementedError("当前非 Windows 环境，缺少 win32com/pythoncom 支持，无法执行本地 PPT 转图片。")
         pythoncom.CoInitialize()
         ppt_app = None
         presentation = None
