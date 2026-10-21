@@ -2,13 +2,14 @@
 from atguigu.config.config import PromptConfig
 from pymilvus import MilvusClient
 from atguigu.config.config import MilvusConfig
-from atguigu.tool.bgem3_client_tool import get_bgem3_embedding
+# 【Colab远程部署改造】原本地模型版 bgem3_client_tool 改为远程 HTTP 版（函数签名与返回结构不变）
+from atguigu.tool.bgem3_http_tool import get_bgem3_embedding
 from pymilvus import CollectionSchema
 from pymilvus import DataType
 from atguigu.tool.milvus_client_tool import get_milvus_client
 from langchain.chat_models import init_chat_model
 import os
-from atguigu.config.config import LLMConfig
+from atguigu.config.config import LLMConfig, TextLLMConfig  # 【Colab远程部署改造】文本模型走网关配置
 from atguigu.tool.validate_path import validate_path
 from atguigu.tool.logger import logger
 from atguigu.tool.json_format_tool import json_format
@@ -69,10 +70,11 @@ class NodeItemNameRecognition(NodeBase):
         content_example = json.dumps(chunks[:10], ensure_ascii=False)[:MAX_LENGTH]
 
         llm = init_chat_model(
-            model=LLMConfig.item_model,
+            model=TextLLMConfig.default_model,
             model_provider="openai",
-            base_url=LLMConfig.base_url,
-            api_key=LLMConfig.api_key,
+            base_url=TextLLMConfig.base_url,
+            api_key=TextLLMConfig.api_key,
+            extra_body=TextLLMConfig.extra_body,
             temperature=LLMConfig.temperature,
         )
         msg = [

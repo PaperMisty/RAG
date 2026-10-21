@@ -28,6 +28,20 @@ class LLMConfig:
     model_provider = "openai"
 
 
+class TextLLMConfig:
+    # 【Colab远程部署改造】文本大模型专用配置，与 LLMConfig 分开，原因：
+    # LLMConfig 的 base_url / api_key 还被 VL 模型（import_process/nodes/node_md_img.py）
+    # 与 Web 搜索 MCP（query_process/nodes/node_web_search_mcp.py 的 token）共用，
+    # 不能整体改指向网关；只有文本模型改走 Colab 上的 LiteLLM 网关，用这一组 TEXT_LLM_* 变量。
+    api_key = os.getenv("TEXT_LLM_OPENAI_API_KEY")
+    base_url = os.getenv("TEXT_LLM_OPENAI_API_BASE")
+    default_model = os.getenv("TEXT_LLM_DEFAULT_MODEL")
+    model_provider = "openai"
+    # 关闭思维链：Qwen3.8 默认在 content 里返回思考过程（以 /think 结束标签收尾），
+    # 会污染 RAG 回答正文并大量消耗输出 token；经 ChatOpenAI 的 extra_body 透传给 vLLM。
+    extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+
+
 class MinIOConfig:
     minio_endpoint = os.getenv("MINIO_ENDPOINT")
     minio_access = os.getenv("MINIO_ACCESS")
@@ -42,6 +56,10 @@ class EmbeddingConfig:
     bge_device = os.getenv("BGE_DEVICE")
     # 特殊处理：将.env中的1/0转为布尔值，兼容常见的数字/字符串格式
     bge_fp16 = os.getenv("BGE_FP16") in ("1", "True", "true", 1)
+    # 【Colab远程部署改造】远程 BGE-M3 服务地址（TEI 的 /embed_all 或 FastAPI 回退的 /v1/embeddings）
+    bge_m3_url = os.getenv("BGE_M3_URL")
+    # 远程向量/重排后端开关：tei（默认）或 fastapi（回退），embedding 与 rerank 共用
+    embed_backend = os.getenv("EMBED_BACKEND", "tei")
 
 
 class MilvusConfig:
@@ -61,6 +79,11 @@ class MCPConfig:
 
 class ReRankerConfig:
     reranker_base_url = os.getenv("RERANK_BASE_URL")
+    # 【Colab远程部署改造】自托管 Rerank 服务地址（TEI 的 /rerank 或 FastAPI 回退的 /v1/rerank），
+    # 替代原百炼 DashScope 云重排（reranker_tool.py 保留未删，便于回滚）
+    reranker_url = os.getenv("BGE_RERANKER_URL")
+    # 与 EmbeddingConfig 共用同一个后端开关 EMBED_BACKEND
+    embed_backend = os.getenv("EMBED_BACKEND", "tei")
 
 
 class PromptConfig:

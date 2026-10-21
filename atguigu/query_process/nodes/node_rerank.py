@@ -1,6 +1,7 @@
 # atguigu/query_process/nodes/node_rerank.py
 
-from atguigu.tool.reranker_tool import text_rerank
+# 【Colab远程部署改造】原百炼 DashScope 版 reranker_tool 改为自托管远程版（函数签名与返回结构不变）
+from atguigu.tool.reranker_http_tool import text_rerank
 from atguigu.tool.json_format_tool import json_format
 from atguigu.query_process.base import NodeBase
 from atguigu.query_process.state import QueryGraphState

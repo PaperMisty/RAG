@@ -6,8 +6,9 @@ from atguigu.config.config import MilvusConfig
 from atguigu.tool.json_format_tool import json_format
 from atguigu.tool.milvus_client_tool import weighted_hybrid_search
 from atguigu.tool.milvus_client_tool import create_reqs
-from atguigu.tool.bgem3_client_tool import get_bgem3_embedding
-from atguigu.config.config import LLMConfig, PromptConfig
+# 【Colab远程部署改造】原本地模型版 bgem3_client_tool 改为远程 HTTP 版（函数签名与返回结构不变）
+from atguigu.tool.bgem3_http_tool import get_bgem3_embedding
+from atguigu.config.config import LLMConfig, PromptConfig, TextLLMConfig  # 【Colab远程部署改造】文本模型走网关配置
 from langchain.chat_models import init_chat_model
 from atguigu.tool.mongo_client_tool import get_recent_history_list
 from atguigu.tool.mongo_client_tool import add_or_update_data
@@ -124,10 +125,11 @@ class NodeItemNameConfirm(NodeBase):
             tuple: (rewritten_query, item_names)
         """
         llm = init_chat_model(
-            model=LLMConfig.item_model,
-            model_provider=LLMConfig.model_provider,
-            base_url=LLMConfig.base_url,
-            api_key=LLMConfig.api_key,
+            model=TextLLMConfig.default_model,
+            model_provider=TextLLMConfig.model_provider,
+            base_url=TextLLMConfig.base_url,
+            api_key=TextLLMConfig.api_key,
+            extra_body=TextLLMConfig.extra_body,
             temperature=LLMConfig.temperature,
         )
 

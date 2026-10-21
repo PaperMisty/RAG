@@ -1,6 +1,7 @@
 # atguigu/import_process/nodes/node_bge_embedding.py
 from atguigu.tool.validate_path import validate_path
-from atguigu.tool.bgem3_client_tool import get_bgem3_embedding
+# 【Colab远程部署改造】原本地模型版 bgem3_client_tool 改为远程 HTTP 版（函数签名与返回结构不变）
+from atguigu.tool.bgem3_http_tool import get_bgem3_embedding
 from atguigu.tool.json_format_tool import json_format
 from atguigu.config.config import OUTPUT_DIR
 from atguigu.import_process.base import NodeBase

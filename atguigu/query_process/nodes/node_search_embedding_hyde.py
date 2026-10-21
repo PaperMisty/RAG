@@ -1,7 +1,7 @@
 # atguigu/query_process/nodes/node_search_embedding_hyde.py
 
 from atguigu.config.config import PromptConfig
-from atguigu.config.config import LLMConfig
+from atguigu.config.config import LLMConfig, TextLLMConfig  # 【Colab远程部署改造】文本模型走网关配置
 from atguigu.config.config import MilvusConfig
 from langchain.chat_models import init_chat_model
 from atguigu.query_process.nodes.node_search_embedding import NodeSearchEmbedding
@@ -34,10 +34,11 @@ class NodeSearchEmbeddingHyde(NodeBase):
             raise ValueError(f"缺少主体名称或改写后的问题{item_names=},{rewritten_query=}")
 
         llm = init_chat_model(
-            model=LLMConfig.item_model,
-            model_provider=LLMConfig.model_provider,
-            base_url=LLMConfig.base_url,
-            api_key=LLMConfig.api_key,
+            model=TextLLMConfig.default_model,
+            model_provider=TextLLMConfig.model_provider,
+            base_url=TextLLMConfig.base_url,
+            api_key=TextLLMConfig.api_key,
+            extra_body=TextLLMConfig.extra_body,
             temperature=LLMConfig.temperature,
         )
         msg = [

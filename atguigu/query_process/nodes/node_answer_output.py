@@ -2,7 +2,7 @@
 
 from atguigu.tool.json_format_tool import json_format
 from atguigu.tool.mongo_client_tool import add_or_update_data
-from atguigu.config.config import LLMConfig
+from atguigu.config.config import LLMConfig, TextLLMConfig  # 【Colab远程部署改造】文本模型走网关配置
 from langchain.chat_models import init_chat_model
 from atguigu.tool.mongo_client_tool import get_recent_history_list
 from atguigu.config.config import PromptConfig
@@ -69,10 +69,11 @@ class NodeAnswerOutput(NodeBase):
                 context=combine_content, history=combine_session, question=rewritten_query
             )
             llm = init_chat_model(
-                model=LLMConfig.item_model,
-                model_provider=LLMConfig.model_provider,
-                base_url=LLMConfig.base_url,
-                api_key=LLMConfig.api_key,
+                model=TextLLMConfig.default_model,
+                model_provider=TextLLMConfig.model_provider,
+                base_url=TextLLMConfig.base_url,
+                api_key=TextLLMConfig.api_key,
+            extra_body=TextLLMConfig.extra_body,
                 temperature=LLMConfig.temperature,
             )
             msg = [{"role": "user", "content": prompt}]
@@ -132,10 +133,11 @@ class NodeAnswerOutput(NodeBase):
                 context=combine_content, history=combine_session, item_names=item_names, question=rewritten_query
             )
             llm = init_chat_model(
-                model=LLMConfig.item_model,
-                model_provider=LLMConfig.model_provider,
-                base_url=LLMConfig.base_url,
-                api_key=LLMConfig.api_key,
+                model=TextLLMConfig.default_model,
+                model_provider=TextLLMConfig.model_provider,
+                base_url=TextLLMConfig.base_url,
+                api_key=TextLLMConfig.api_key,
+            extra_body=TextLLMConfig.extra_body,
                 temperature=LLMConfig.temperature,
             )
             msg = [{"role": "user", "content": prompt}]
