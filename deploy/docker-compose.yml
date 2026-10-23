@@ -71,27 +71,7 @@ services:
         max-file: "3"
 
   # --------------------------------------------------------------------------
-  # 3. MinIO 初始化服务: 自动创建 knowledge-base 桶并开启下载公开读权限
-  # --------------------------------------------------------------------------
-  minio-init:
-    container_name: rag-minio-init
-    image: minio/mc:RELEASE.2023-03-20T17-17-53Z
-    depends_on:
-      minio:
-        condition: service_healthy
-    networks:
-      - rag-net
-    entrypoint: >
-      /bin/sh -c "
-      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
-      /usr/bin/mc mb --ignore-existing myminio/knowledge-base;
-      /usr/bin/mc anonymous set download myminio/knowledge-base;
-      echo '[minio-init] knowledge-base 桶初始化完成，已赋予公开只读权限';
-      exit 0;
-      "
-
-  # --------------------------------------------------------------------------
-  # 4. Milvus: 核心向量数据库 (Standalone 单机版)
+  # 3. Milvus: 核心向量数据库 (Standalone 单机版)
   # --------------------------------------------------------------------------
   standalone:
     container_name: rag-milvus-standalone
@@ -127,7 +107,7 @@ services:
         max-file: "3"
 
   # --------------------------------------------------------------------------
-  # 5. Attu: Milvus 官方可视化管理面板 (Web GUI)
+  # 4. Attu: Milvus 官方可视化管理面板 (Web GUI)
   # --------------------------------------------------------------------------
   attu:
     container_name: rag-milvus-attu
@@ -149,11 +129,11 @@ services:
         max-file: "2"
 
   # --------------------------------------------------------------------------
-  # 6. MongoDB: 多轮对话上下文与历史存储
+  # 5. MongoDB: 多轮对话上下文与历史存储
   # --------------------------------------------------------------------------
   mongodb:
     container_name: rag-mongodb
-    image: mongo:6.0
+    image: mongo:7.0
     restart: unless-stopped
     ports:
       - "27017:27017"
