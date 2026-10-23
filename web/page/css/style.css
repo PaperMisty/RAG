@@ -1155,3 +1155,46 @@ textarea::placeholder {
     border-color: #e4decb;
 }
 
+/* 原文 Markdown 渲染样式（引用抽屉） */
+.drawer-value.md-content {
+    max-height: 400px;
+    overflow-y: auto;
+    background: #ffffff;
+    word-break: break-word;
+}
+.drawer-value.md-content img {
+    display: block;
+    max-width: 100%;
+    max-height: 260px;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    margin: 8px 0;
+    background: #ffffff;
+}
+.drawer-value.md-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 13px;
+    background: #ffffff;
+}
+.drawer-value.md-content th, .drawer-value.md-content td {
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    text-align: left;
+}
+.drawer-value.md-content th {
+    background-color: #f4edd8;
+    font-weight: 600;
+}
+.drawer-value.md-content h1, .drawer-value.md-content h2,
+.drawer-value.md-content h3, .drawer-value.md-content h4 {
+    margin: 12px 0 6px;
+    line-height: 1.35;
+}
+.drawer-value.md-content p { margin: 6px 0; }
+
+

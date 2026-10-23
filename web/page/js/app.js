@@ -144,6 +144,35 @@ function parseConfirmOptions(text) {
     return null;
 }
 
+// 引用角标重编号：把答案中的 [[chunk_id]] 按首次出现顺序重编号为 [1][2]...（同一 chunk 复用同一编号，点击仍按 chunk_id 打开原文抽屉）
+function linkCitations(mdText) {
+    const seqByChunkId = new Map();
+    return mdText.replace(/\[\[(\d+)\]\]/g, (match, chunkId) => {
+        if (!seqByChunkId.has(chunkId)) {
+            seqByChunkId.set(chunkId, seqByChunkId.size + 1);
+        }
+        return `<span class="citation-badge" onclick="openSourceDrawer('${chunkId}')">[${seqByChunkId.get(chunkId)}]</span>`;
+    });
+}
+
+// 原文（chunk）Markdown 渲染：图片/链接 URL 空格转义后交给 marked，渲染为 HTML 供引用抽屉展示（图片将以 <img> 真实加载）
+function formatChunkToHtml(chunkText) {
+    if (!chunkText) return '';
+    let mdText = String(chunkText);
+    mdText = mdText.replace(/!\[(.*?)\]\((.*?)\)/g, (match, alt, url) => {
+        const cleanUrl = url.trim().replace(/\s+/g, '%20');
+        return `![${alt}](${cleanUrl})`;
+    });
+    mdText = mdText.replace(/(?<!\!)\[(.*?)\]\((.*?)\)/g, (match, text, url) => {
+        const cleanUrl = url.trim().replace(/\s+/g, '%20');
+        return `[${text}](${cleanUrl})`;
+    });
+    if (typeof marked !== 'undefined' && typeof marked.parse === 'function') {
+        return marked.parse(mdText);
+    }
+    return escapeHtml(mdText).replace(/\r?\n/g, '<br>');
+}
+
 function formatAnswerToHtml(answerText) {
     if (!answerText) return '';
 
@@ -190,11 +219,8 @@ function formatAnswerToHtml(answerText) {
     const imgRegex = /(?<!\()https?:\/\/[^\s<>\u007f-\u009f]+?\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\?[^\s<>#]*)?/gi;
     mdText = mdText.replace(imgRegex, (url) => `![图片](${url})`);
 
-    // 3.5 识别引用标注 [[chunk_id]] 格式并替换为可点击的引用角标
-    mdText = mdText.replace(/\[\[(\d+)\]\]/g, (match, chunkId) => {
-        const displayLabel = chunkId.length > 6 ? chunkId.slice(-4) : chunkId;
-        return `<span class="citation-badge" onclick="openSourceDrawer('${chunkId}')">[${displayLabel}]</span>`;
-    });
+    // 3.5 识别引用标注 [[chunk_id]] 格式并替换为可点击的引用角标（按出现顺序重编号，见 linkCitations）
+    mdText = linkCitations(mdText);
 
     // 调用 marked 解析库解析 Markdown，如果未引入则 fallback 降级为普通文本
     let html = '';
@@ -789,7 +815,7 @@ window.openSourceDrawer = function(chunkId) {
 
     document.getElementById('drawerFileTitle').textContent = chunk.file_title || '未知来源';
     document.getElementById('drawerSectionTitle').textContent = chunk.section_title || '正文小节';
-    document.getElementById('drawerChunkContent').textContent = chunk.content || '暂无内容';
+    document.getElementById('drawerChunkContent').innerHTML = formatChunkToHtml(chunk.content || '暂无内容');
 
     sourceDrawer.classList.add('open');
     drawerOverlay.classList.add('open');
