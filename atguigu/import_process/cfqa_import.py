@@ -42,9 +42,10 @@ from atguigu.config.config import (
     MilvusConfig,
     MineruConfig,
 )
-from atguigu.import_process.nodes.node_bge_embedding import NodeBGEEmbedding
 from atguigu.import_process.nodes.node_document_split import NodeDocumentSplit
 from atguigu.import_process.nodes.node_import_milvus import NodeImportMilvus
+from atguigu.tool.bgem3_tool import get_bgem3_embedding
+from atguigu.tool.json_format_tool import json_format
 from atguigu.tool.colab_client import (
     PAGE_MARKER_TEMPLATE,
     build_page_annotated_md,
@@ -232,8 +233,22 @@ def import_one(row: dict, collection: str, pages_per_request: int, force: bool) 
             chunks_json_path = out_dir / f"{stem}_chunks.json"
             chunks_json_path.write_text(json_format(chunks), encoding="utf-8")
 
-        embed_node = NodeBGEEmbedding()
-        embed_node.process({"chunk_dict_list": chunks, "md_path": str(md_path)})
+        # 向量化不走 NodeBGEEmbedding：其固定 10 条/批是为单文档交互导入
+        # 设计的，批量场景下每批两次 HTTP 往返的固定开销占主导（实测约
+        # 3.5s/10 条）。这里按 64 条/批直调同一共享工具 get_bgem3_embedding
+        # （EMBED_SOURCE 已切 colab），拼接方式与节点一致（item_name 前缀），
+        # 产物文件格式与节点版完全相同，图流程的节点版不受影响。
+        embed_batch = 64
+        for i in range(0, len(chunks), embed_batch):
+            batch = chunks[i : i + embed_batch]
+            contents = [f"{c['item_name']}\n{c['chunk_content']}" for c in batch]
+            vector_data = get_bgem3_embedding(contents)
+            for idx, chunk in enumerate(batch):
+                chunk["dense"] = vector_data["dense"][idx]
+                chunk["sparse"] = vector_data["sparse"][idx]
+            logger.info(f"{stem} 向量化 {min(i + embed_batch, len(chunks))}/{len(chunks)}")
+        embedding_path = out_dir / f"{stem}_embedding_chunks.json"
+        embedding_path.write_text(json_format(chunks), encoding="utf-8")
 
         import_node = NodeImportMilvus()
         import_node.process({"chunk_dict_list": chunks})

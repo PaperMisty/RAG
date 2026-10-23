@@ -32,6 +32,11 @@ PAGE_MARKER_TEMPLATE = "<!-- page:{page} -->"
 PAGE_MARKER_RE = re.compile(r"^<!--\s*page:(\d+)\s*-->$")
 
 _session = requests.Session()
+# 联调实测（2026-10-23）：经用户侧 Clash fake-ip + Cloudflare 隧道的长连接
+# 池会半死（请求已发出、响应永不到达，进程整段阻塞在 ssl read，urllib3 的
+# 读超时按单次 recv 计也救不了）。对策：禁用连接复用，每次请求新建连接，
+# 开销（握手 ~0.3s）远小于推理耗时，可接受。
+_session.headers.update({"Connection": "close"})
 
 # TEI 单请求批量上限各部署不一，客户端先按 32 分批，稳妥优先
 _EMBED_BATCH = 32
@@ -72,7 +77,9 @@ def _base_url() -> str:
 
 def colab_health() -> dict:
     """网关健康检查：GET /health，返回网关聚合的各服务状态。"""
-    resp = _session.get(f"{_base_url()}/health", timeout=ColabConfig.colab_timeout)
+    resp = _session.get(
+        f"{_base_url()}/health", timeout=(10, ColabConfig.colab_timeout)
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -95,14 +102,14 @@ def _embed_batch(texts: list[str]) -> dict:
     base = _base_url()
     payload = {"inputs": texts, "truncate": True}
     resp = _post_with_retry(
-        f"{base}/embed", json=payload, timeout=ColabConfig.colab_timeout
+        f"{base}/embed", json=payload, timeout=(10, ColabConfig.colab_timeout)
     )
     resp.raise_for_status()
     dense_raw = _unwrap_list(resp.json(), "embeddings", "data", "dense")
     dense = [[float(x) for x in vec] for vec in dense_raw]
 
     resp = _post_with_retry(
-        f"{base}/embed_sparse", json=payload, timeout=ColabConfig.colab_timeout
+        f"{base}/embed_sparse", json=payload, timeout=(10, ColabConfig.colab_timeout)
     )
     resp.raise_for_status()
     sparse_raw = _unwrap_list(resp.json(), "embeddings", "data", "sparse")
@@ -205,7 +212,7 @@ def colab_parse_pdf(pdf_path: str | Path) -> dict:
         resp = _post_with_retry(
             f"{base}/parse",
             files={field_name: (pdf_path.name, pdf_bytes, "application/pdf")},
-            timeout=ColabConfig.colab_parse_timeout,
+            timeout=(10, ColabConfig.colab_parse_timeout),
         )
         if resp.status_code != 422:
             break
