@@ -42,9 +42,12 @@ _session.headers.update({"Connection": "close"})
 _EMBED_BATCH = 32
 
 # 网关经 Cloudflare 隧道偶发 502（2026-10-23 联调实测：并发/负载下出现），
-# 对幂等 POST 做有限重试，避免整批导入被单次抖动打断
-_RETRY_STATUSES = (502, 503, 504)
-_RETRY_BACKOFFS = (5, 15, 30)
+# 对幂等 POST 做有限重试，避免整批导入被单次抖动打断。
+# 530 是 Cloudflare 隧道源站不可达（cloudflared 掉线重连中），同为瞬态：
+# 退避拉长到五次共约 3.5 分钟，覆盖一次隧道重连窗口；再久则整份失败，
+# 由驱动的断点续跑（已完成文档跳过）兜底，不无限等。
+_RETRY_STATUSES = (502, 503, 504, 530)
+_RETRY_BACKOFFS = (10, 30, 60, 120)
 
 
 def _post_with_retry(url: str, **kwargs) -> requests.Response:
