@@ -183,6 +183,49 @@ def align_chunk_pages(pdf_path: Path, chunks: list[dict], window: int) -> dict:
     return {"chunks_total": len(chunks), "chunks_anchored": anchored}
 
 
+_IMG_PLACEHOLDER = "[图片]"
+_DATA_URI_IMG_RE = re.compile(r"data:image/[\w.+-]+;base64,[A-Za-z0-9+/=]+")
+_LONG_B64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{1000,}={0,2}")
+_VARCHAR_SAFE_BYTES = 60000
+_HARD_SPLIT_CHARS = 12000
+
+
+def sanitize_chunks(chunks: list[dict]) -> dict:
+    """入库前 chunk 守卫（就地修改 chunks 列表）。
+
+    MinerU 的 md 会把图片以 base64 data URI 内联进正文，切分后个别
+    chunk 几乎整块是 base64（天合光能 2022 实测 7 个、最长 15 万字符），
+    既撑爆 Milvus chunk_content 的 varchar 上限（65535），对文本检索
+    也只是噪声。本流水线按设计跳过图片处理（NodeMDImg），故在此剥离
+    图片数据：完整 data URI 与被 chunk 边界切断的裸 base64 长串都
+    替换为占位符；剥离后仍超长的 chunk 再按字符硬切分兜底（继承
+    页码等全部元数据）。返回统计 dict，供写入 summary。
+    """
+    stats = {"sanitized_chunks": 0, "b64_chars_removed": 0, "hard_split_chunks": 0}
+    out: list[dict] = []
+    for chunk in chunks:
+        content = chunk["chunk_content"]
+        cleaned = _DATA_URI_IMG_RE.sub(_IMG_PLACEHOLDER, content)
+        cleaned = _LONG_B64_RUN_RE.sub(_IMG_PLACEHOLDER, cleaned)
+        if cleaned != content:
+            stats["sanitized_chunks"] += 1
+            stats["b64_chars_removed"] += len(content) - len(cleaned)
+            chunk = {**chunk, "chunk_content": cleaned}
+            content = cleaned
+        if len(content.encode("utf-8")) > _VARCHAR_SAFE_BYTES:
+            stats["hard_split_chunks"] += 1
+            for j in range(0, len(content), _HARD_SPLIT_CHARS):
+                piece = dict(chunk)
+                piece["chunk_content"] = content[j : j + _HARD_SPLIT_CHARS]
+                piece["part"] = f"{chunk.get('part', '0')}.{j // _HARD_SPLIT_CHARS}"
+                out.append(piece)
+        else:
+            out.append(chunk)
+    chunks[:] = out
+    stats["chunks_after"] = len(out)
+    return stats
+
+
 def import_one(row: dict, collection: str, pages_per_request: int, force: bool) -> dict:
     stem = Path(row["filename"]).stem
     company = row["company"]
@@ -230,6 +273,15 @@ def import_one(row: dict, collection: str, pages_per_request: int, force: bool) 
             # 页码已变，回写 chunks json 保持磁盘产物与入库一致
             from atguigu.tool.json_format_tool import json_format
 
+            chunks_json_path = out_dir / f"{stem}_chunks.json"
+            chunks_json_path.write_text(json_format(chunks), encoding="utf-8")
+
+        # 入库守卫：剥离 base64 图片数据 + 超长兜底切分（见 sanitize_chunks）
+        guard_stats = sanitize_chunks(chunks)
+        summary["chunk_guard"] = guard_stats
+        summary["chunks_final"] = len(chunks)
+        if guard_stats["sanitized_chunks"] or guard_stats["hard_split_chunks"]:
+            logger.info(f"{stem} chunk 守卫: {guard_stats}")
             chunks_json_path = out_dir / f"{stem}_chunks.json"
             chunks_json_path.write_text(json_format(chunks), encoding="utf-8")
 
