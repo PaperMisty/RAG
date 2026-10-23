@@ -36,8 +36,11 @@ def _sparse_item_to_dict(item) -> dict:
     3. {token_id: weight} 字典（JSON 里键会变成字符串，这里转回 int，
        与本地版 BGEM3EmbeddingFunction 输出的 int 键保持一致，Milvus 侧才认）
     """
-    if isinstance(item, dict) and "indices" in item and "values" in item:
-        return {int(i): float(v) for i, v in zip(item["indices"], item["values"])}
+    if isinstance(item, dict) and "indices" in item and ("values" in item or "weights" in item):
+        # Colab 网关（FlagEmbedding 实现）的 /embed_sparse 用 weights 命名权重，
+        # 与 TEI 惯例的 values 等价，两种都认（2026-10-23 联调实测确认）
+        values = item["values"] if "values" in item else item["weights"]
+        return {int(i): float(v) for i, v in zip(item["indices"], values)}
     if isinstance(item, dict):
         return {int(k): float(v) for k, v in item.items()}
     if isinstance(item, list):
