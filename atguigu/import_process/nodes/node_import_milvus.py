@@ -110,7 +110,24 @@ class NodeImportMilvus(NodeBase):
             {k: v for k, v in chunk.items() if k in schema_fields and k != "id"}
             for chunk in chunks
         ]
-        result = client.insert(chunk_collection, data=insert_rows)
+        try:
+            result = client.insert(chunk_collection, data=insert_rows)
+        except Exception as e:
+            # 入库兜底（用户 2026-10-23 规格）：chunk 超长触发 varchar
+            # 上限硬报错时，不整份文档失败——把超长表格 chunk 按完整
+            # 行拆分、重新向量化后重试一次。无可拆对象则原样抛错。
+            remedied = self._split_oversized_chunks(chunks)
+            if remedied is None:
+                raise
+            logger.warning(f"入库首次失败（{e}），超长表格 chunk 已按行拆分并重新向量化，重试入库")
+            chunks = remedied
+            # 保持幂等：重试前按 file_title 再删一次，避免首次部分写入造成重复
+            client.delete(chunk_collection, filter=f"file_title == '{file_title}'")
+            insert_rows = [
+                {k: v for k, v in chunk.items() if k in schema_fields and k != "id"}
+                for chunk in chunks
+            ]
+            result = client.insert(chunk_collection, data=insert_rows)
         logger.info(f"{chunk_collection}插入数据成功")
 
         # 给chunk的json文件回填id信息
@@ -120,6 +137,48 @@ class NodeImportMilvus(NodeBase):
                 chunk["id"] = ids[i]
 
         return {"chunk_dict_list": chunks}
+
+    def _split_oversized_chunks(self, chunks: list[dict]) -> list[dict] | None:
+        """入库兜底：找出正文字节数超过 varchar 上限的 chunk，把其中
+        的超长表格按完整行拆成 <=300 字片段并重新向量化；无可拆分
+        对象时返回 None（调用方原样抛错）。
+
+        拆分片段必须重新向量化：其 dense/sparse 与原 chunk 不对应，
+        沿用旧向量会让检索内容与向量错位。向量化走 bgem3_tool 统一
+        入口，文本组织（item_name + 换行 + chunk_content）与
+        NodeBGEEmbedding 保持一致。
+        """
+        from atguigu.import_process.table_splitter import (
+            expand_chunk_dict,
+            split_table_content,
+        )
+        from atguigu.tool.bgem3_tool import get_bgem3_embedding
+
+        limit_bytes = 65535  # 与本节点 schema 中 chunk_content 的 max_length 一致
+        new_chunks: list[dict] = []
+        for chunk in chunks:
+            content = chunk.get("chunk_content", "")
+            if len(content.encode("utf-8")) <= limit_bytes:
+                new_chunks.append(chunk)
+                continue
+            fragments = split_table_content(content, 300)
+            expanded = expand_chunk_dict(chunk, fragments)
+            if len(expanded) == 1 and expanded[0] is chunk:
+                return None  # 超限但无表可拆，补救不了
+            new_chunks.extend(expanded)
+        # 未变的 chunk 仍带 dense 字段；被拆出的片段已剔除旧向量，只补这些
+        to_embed = [c for c in new_chunks if "dense" not in c]
+        if not to_embed:
+            return None
+        batch_size = 64
+        for i in range(0, len(to_embed), batch_size):
+            batch = to_embed[i : i + batch_size]
+            texts = [f"{c['item_name']}\n{c['chunk_content']}" for c in batch]
+            vector_data = get_bgem3_embedding(texts)
+            for idx, c in enumerate(batch):
+                c["dense"] = vector_data["dense"][idx]
+                c["sparse"] = vector_data["sparse"][idx]
+        return new_chunks
 
 
 if __name__ == "__main__":

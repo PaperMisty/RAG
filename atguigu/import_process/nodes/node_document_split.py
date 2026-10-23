@@ -9,6 +9,7 @@ from atguigu.config.config import OUTPUT_DIR
 from atguigu.tool.logger import logger
 from atguigu.tool.json_format_tool import json_format
 from atguigu.tool.colab_client import PAGE_MARKER_RE
+from atguigu.import_process.table_splitter import split_table_content
 import re
 
 
@@ -184,15 +185,26 @@ class NodeDocumentSplit(NodeBase):
         # TODO 去除段落标题应该在最前面进行
         is_table = ("<table" in section_content) or (re.search(r"\|\s*[-:]+\s*\|", section_content) is not None)
         if len(section_content) < 300 or is_table:
-            chunk_dict_list.append(
-                {
-                    "file_title": file_title,
-                    "section_title": section_title,  # section_title作用在于父子文档切分时候的定位, chunk进行向量化不附件section_title, 而是附加item_name
-                    "chunk_content": section_content,
-                    "part": 0,
-                    "page": page,
-                }
-            )
+            chunk_contents = [section_content]
+            if is_table and len(section_content) >= MAX_LENGTH:
+                # 表格行拆分（用户 2026-10-23 规格）：含表格的 section 原本
+                # 整段成 chunk，超长表会同时踩 Milvus varchar 硬报错与
+                # BGE-M3 静默截断两层坑；此处按完整行拆成 <=300 字的
+                # 结构完整迷你表（见 import_process/table_splitter）。
+                # TODO(长表回归): 当前语料无极端长表文档，真长表出现时需复测。
+                chunk_contents = split_table_content(section_content, MAX_LENGTH)
+            # 未拆分时 part=0（与原行为一致）；拆分时片段按 1..N 顺延编号
+            part_numbers = [0] if len(chunk_contents) == 1 else range(1, len(chunk_contents) + 1)
+            for chunk_content, part_no in zip(chunk_contents, part_numbers):
+                chunk_dict_list.append(
+                    {
+                        "file_title": file_title,
+                        "section_title": section_title,  # section_title作用在于父子文档切分时候的定位, chunk进行向量化不附件section_title, 而是附加item_name
+                        "chunk_content": chunk_content,
+                        "part": part_no,
+                        "page": page,
+                    }
+                )
         else:
             real_section_content = section_content[len(section_title) :]  # 去除段落标题
             chunk_list = spliter.split_text(real_section_content)
