@@ -19,6 +19,7 @@ Colab L4 上部署了与本地同构的推理栈，经聚合 FastAPI + Cloudflar
 """
 
 import re
+import time
 from pathlib import Path
 
 import requests
@@ -34,6 +35,30 @@ _session = requests.Session()
 
 # TEI 单请求批量上限各部署不一，客户端先按 32 分批，稳妥优先
 _EMBED_BATCH = 32
+
+# 网关经 Cloudflare 隧道偶发 502（2026-10-23 联调实测：并发/负载下出现），
+# 对幂等 POST 做有限重试，避免整批导入被单次抖动打断
+_RETRY_STATUSES = (502, 503, 504)
+_RETRY_BACKOFFS = (5, 15, 30)
+
+
+def _post_with_retry(url: str, **kwargs) -> requests.Response:
+    last_exc = None
+    for attempt in range(len(_RETRY_BACKOFFS) + 1):
+        try:
+            resp = _session.post(url, **kwargs)
+            if resp.status_code not in _RETRY_STATUSES or attempt == len(_RETRY_BACKOFFS):
+                return resp
+            logger.warning(
+                f"POST {url} 返回 {resp.status_code}，第 {attempt + 1} 次重试前等待 {_RETRY_BACKOFFS[attempt]}s"
+            )
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt == len(_RETRY_BACKOFFS):
+                raise
+            logger.warning(f"POST {url} 异常 {e}，第 {attempt + 1} 次重试前等待 {_RETRY_BACKOFFS[attempt]}s")
+        time.sleep(_RETRY_BACKOFFS[attempt])
+    raise last_exc  # pragma: no cover
 
 
 def _base_url() -> str:
@@ -69,14 +94,14 @@ def _embed_batch(texts: list[str]) -> dict:
 
     base = _base_url()
     payload = {"inputs": texts, "truncate": True}
-    resp = _session.post(
+    resp = _post_with_retry(
         f"{base}/embed", json=payload, timeout=ColabConfig.colab_timeout
     )
     resp.raise_for_status()
     dense_raw = _unwrap_list(resp.json(), "embeddings", "data", "dense")
     dense = [[float(x) for x in vec] for vec in dense_raw]
 
-    resp = _session.post(
+    resp = _post_with_retry(
         f"{base}/embed_sparse", json=payload, timeout=ColabConfig.colab_timeout
     )
     resp.raise_for_status()
@@ -177,7 +202,7 @@ def colab_parse_pdf(pdf_path: str | Path) -> dict:
     # 网关文件字段名以联调为准：先试单数 file（FastAPI UploadFile 惯例），
     # 422 时回退 MinerU 原生 API 的复数 files，只重试一次。
     for field_name in ("file", "files"):
-        resp = _session.post(
+        resp = _post_with_retry(
             f"{base}/parse",
             files={field_name: (pdf_path.name, pdf_bytes, "application/pdf")},
             timeout=ColabConfig.colab_parse_timeout,
@@ -188,7 +213,16 @@ def colab_parse_pdf(pdf_path: str | Path) -> dict:
     resp.raise_for_status()
     data = resp.json()
 
-    md_content = _find_key(data, ("md_content", "markdown", "md", "full_md"), str) or ""
+    # 网关（MinerU 4.x kit 形态）实测结构：files[0].content.markdown 为正文，
+    # 且服务端只输出 markdown（structured_content/middle_json 恒为 null、
+    # 请求参数无法开启）——页级结构拿不到，页码对齐由导入驱动用 PDF 文本层
+    # 锚点回填（见 cfqa_import.align_chunk_pages）。优先按已知路径精确取，
+    # 找不到再走通用深搜兜底。
+    md_content = ""
+    try:
+        md_content = data["files"][0]["content"]["markdown"] or ""
+    except (KeyError, IndexError, TypeError):
+        md_content = _find_key(data, ("md_content", "markdown", "md", "full_md"), str) or ""
     content_list = _find_key(data, ("content_list", "contentList"), list)
 
     md_annotated = md_content

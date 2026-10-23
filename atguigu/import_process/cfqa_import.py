@@ -28,6 +28,7 @@ import_summary.json（页数/chunk 数/集合/耗时/解析模式）。
 import argparse
 import csv
 import json
+import re
 import time
 from pathlib import Path
 
@@ -105,6 +106,82 @@ def parse_pdf_in_parts(pdf_path: Path, out_dir: Path, pages_per_request: int) ->
     return "\n\n".join(annotated_parts), mode, total_pages
 
 
+_WS_RE = re.compile(r"[\s,，]+")
+_TAG_RE = re.compile(r"<[^>]+>")
+_DIGIT_RUN_RE = re.compile(r"\d[\d,]*\.?\d+|\d")
+
+
+def _norm_text(s: str) -> str:
+    # 除空白外还去掉千分位逗号：PDF 文本层写作 800,000,000.00，
+    # 而 MinerU/答案文本可能不带逗号，两侧统一后才能锚定（联调实测）
+    return _WS_RE.sub("", s or "")
+
+
+def _chunk_anchors(chunk_content: str) -> tuple[str, str]:
+    """为 chunk 选页内定位锚点对（数字锚， 文本锚）。
+
+    数字锚：最长的数字串（>=5 位）。同一金额会在年报多处复述（决议、
+    正文、附表），单靠数字锚可能命中前文页；文本锚取正文 1/3 处
+    16 字切片，用同一 chunk 的语境在候选页中消歧。
+    """
+    plain = _norm_text(_TAG_RE.sub(" ", chunk_content))
+    runs = [r for r in _DIGIT_RUN_RE.findall(plain) if len(r.strip(",")) >= 5]
+    digit_anchor = max(runs, key=len) if runs else ""
+    text_anchor = ""
+    if len(plain) >= 16:
+        pos = len(plain) // 3
+        text_anchor = plain[pos : pos + 16]
+    return digit_anchor, text_anchor
+
+
+def align_chunk_pages(pdf_path: Path, chunks: list[dict], window: int) -> dict:
+    """用 PDF 原生文本层把 chunk 页码从"窗首页"精化到确切页。
+
+    网关只返回 markdown（无 content_list），切分得到的 page 只是解析窗的
+    首页。本函数按 chunk 顺序取锚点，在 [上一个命中页, 窗末尾] 的页文本
+    中顺序查找（文档顺序单调，锚点多为长数字串，窗内近乎唯一），命中则
+    改写 chunk["page"]；未命中保留窗首页。返回对齐统计。
+    """
+    src = pymupdf.open(str(pdf_path))
+    page_texts = [_norm_text(src[i].get_text()) for i in range(src.page_count)]
+    src.close()
+
+    anchored = 0
+    cursor = 0  # 0 起页索引，单调不回退（容忍同页多 chunk）
+    for chunk in chunks:
+        start_page = max(int(chunk.get("page") or 1), 1)  # 窗首页（1 起）
+        win_lo = max(start_page - 1, cursor)
+        win_hi = min(start_page - 1 + window, len(page_texts))
+        digit_anchor, text_anchor = _chunk_anchors(chunk.get("chunk_content", ""))
+
+        def search(lo: int, hi: int) -> int | None:
+            """窗内定位：先数字锚候选页，再文本锚消歧；无数字锚时单用文本锚。"""
+            if digit_anchor:
+                cands = [p for p in range(lo, hi) if digit_anchor in page_texts[p]]
+                if not cands:
+                    return None
+                if len(cands) == 1:
+                    return cands[0]
+                for p in cands:
+                    if text_anchor and text_anchor in page_texts[p]:
+                        return p
+                return cands[0]
+            if text_anchor:
+                for p in range(lo, hi):
+                    if text_anchor in page_texts[p]:
+                        return p
+            return None
+
+        found = search(win_lo, win_hi)
+        if found is None and win_lo > start_page - 1:
+            found = search(start_page - 1, win_lo)
+        if found is not None:
+            chunk["page"] = found + 1
+            cursor = found
+            anchored += 1
+    return {"chunks_total": len(chunks), "chunks_anchored": anchored}
+
+
 def import_one(row: dict, collection: str, pages_per_request: int, force: bool) -> dict:
     stem = Path(row["filename"]).stem
     company = row["company"]
@@ -144,6 +221,16 @@ def import_one(row: dict, collection: str, pages_per_request: int, force: bool) 
             chunk["item_name"] = company
         summary["chunks"] = len(chunks)
         summary["chunks_with_page"] = sum(1 for c in chunks if c.get("page"))
+        if parse_mode == "md_fallback":
+            # 无 content_list 时切分页码只是窗首页，用文本层锚点精化到确切页
+            align_stats = align_chunk_pages(pdf_path, chunks, pages_per_request)
+            summary["align"] = align_stats
+            logger.info(f"{stem} 页码对齐: {align_stats}")
+            # 页码已变，回写 chunks json 保持磁盘产物与入库一致
+            from atguigu.tool.json_format_tool import json_format
+
+            chunks_json_path = out_dir / f"{stem}_chunks.json"
+            chunks_json_path.write_text(json_format(chunks), encoding="utf-8")
 
         embed_node = NodeBGEEmbedding()
         embed_node.process({"chunk_dict_list": chunks, "md_path": str(md_path)})
