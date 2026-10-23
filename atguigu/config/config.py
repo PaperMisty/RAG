@@ -16,6 +16,8 @@ STATIC_DIR = ROOT_DIR / "web" / "page"
 class MineruConfig:
     mineru_token = os.getenv("mineru_token")
     mineru_base_url = os.getenv("mineru_base_url")
+    # 解析后端开关：mineru_cloud（默认，现有云端 API）| colab（Colab 网关 /parse）
+    parse_backend = os.getenv("PARSE_BACKEND", "mineru_cloud")
 
 
 class LLMConfig:
@@ -60,6 +62,17 @@ class EmbeddingConfig:
     bge_m3_url = os.getenv("BGE_M3_URL")
     # 远程向量/重排后端开关：tei（默认）或 fastapi（回退），embedding 与 rerank 共用
     embed_backend = os.getenv("EMBED_BACKEND", "tei")
+    # 向量来源开关：remote（默认，现行 HTTP 远程版）| local（本地模型）| colab（Colab 网关）
+    embed_source = os.getenv("EMBED_SOURCE", "remote")
+
+
+class ColabConfig:
+    # Colab 推理栈聚合网关（FastAPI + Cloudflare 隧道）公网地址，如 https://xxx.trycloudflare.com
+    # 隧道重启后地址会变，只改 .env 不改代码
+    colab_base_url = os.getenv("COLAB_BASE_URL", "")
+    colab_timeout = float(os.getenv("COLAB_TIMEOUT", "120"))
+    # PDF 解析是长任务（数百页年报），单独放宽超时（秒）
+    colab_parse_timeout = float(os.getenv("COLAB_PARSE_TIMEOUT", "1800"))
 
 
 class MilvusConfig:

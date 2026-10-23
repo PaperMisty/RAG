@@ -5,7 +5,7 @@ from atguigu.tool.milvus_client_tool import weighted_hybrid_search
 from atguigu.config.config import MilvusConfig
 from atguigu.tool.milvus_client_tool import create_reqs
 # 【Colab远程部署改造】原本地模型版 bgem3_client_tool 改为远程 HTTP 版（函数签名与返回结构不变）
-from atguigu.tool.bgem3_http_tool import get_bgem3_embedding
+from atguigu.tool.bgem3_tool import get_bgem3_embedding
 from atguigu.query_process.base import NodeBase
 from atguigu.query_process.state import QueryGraphState
 from atguigu.tool.logger import logger
