@@ -57,6 +57,10 @@ class NodeImportMilvus(NodeBase):
                 ).add_field(
                     field_name="part", datatype=DataType.INT64, max_length=1000
                 ).add_field(
+                    # 页码（1 起 PDF 页序，0=未知）：CFQA 金标页级评测依赖此字段；
+                    # 仅新建集合时生效，已存在的旧集合 schema 不受影响
+                    field_name="page", datatype=DataType.INT64
+                ).add_field(
                     field_name="dense", datatype=DataType.FLOAT_VECTOR, dim=chunk_dim
                 ).add_field(
                     field_name="sparse",
@@ -96,8 +100,17 @@ class NodeImportMilvus(NodeBase):
         file_title = file_title.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
         client.delete(chunk_collection, filter=f"file_title == '{file_title}'")
 
-        # 插入数据
-        result = client.insert(chunk_collection, data=chunks)
+        # 插入数据：先按目标集合的实际字段过滤 chunk 字典——切分侧新增的字段
+        # （如 page）在旧集合（无该字段）上自动剔除，避免整批插入因未知字段
+        # 失败；带 page 字段的新集合则完整写入。id 为自增主键，不入数据。
+        schema_fields = {
+            f["name"] for f in client.describe_collection(chunk_collection)["fields"]
+        }
+        insert_rows = [
+            {k: v for k, v in chunk.items() if k in schema_fields and k != "id"}
+            for chunk in chunks
+        ]
+        result = client.insert(chunk_collection, data=insert_rows)
         logger.info(f"{chunk_collection}插入数据成功")
 
         # 给chunk的json文件回填id信息
