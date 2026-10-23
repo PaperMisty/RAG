@@ -7,7 +7,7 @@ from atguigu.tool.json_format_tool import json_format
 from atguigu.tool.milvus_client_tool import weighted_hybrid_search
 from atguigu.tool.milvus_client_tool import create_reqs
 # 【Colab远程部署改造】原本地模型版 bgem3_client_tool 改为远程 HTTP 版（函数签名与返回结构不变）
-from atguigu.tool.bgem3_http_tool import get_bgem3_embedding
+from atguigu.tool.bgem3_tool import get_bgem3_embedding  # 改走统一分发(EMBED_SOURCE),与检索/入库一致;原写死远程 HTTP 版
 from atguigu.config.config import LLMConfig, PromptConfig, TextLLMConfig  # 【Colab远程部署改造】文本模型走网关配置
 from langchain.chat_models import init_chat_model
 from atguigu.tool.mongo_client_tool import get_recent_history_list
