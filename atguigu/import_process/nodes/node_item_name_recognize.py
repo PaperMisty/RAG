@@ -2,8 +2,9 @@
 from atguigu.config.config import PromptConfig
 from pymilvus import MilvusClient
 from atguigu.config.config import MilvusConfig
-# 【Colab远程部署改造】原本地模型版 bgem3_client_tool 改为远程 HTTP 版（函数签名与返回结构不变）
-from atguigu.tool.bgem3_http_tool import get_bgem3_embedding
+# 向量化走统一分发 bgem3_tool（按 EMBED_SOURCE 选 local/remote/colab，与 node_bge_embedding 一致）；
+# 原写死 bgem3_http_tool 远程版，EMBED_SOURCE=local 的本地入库路径下主体向量无处可取，故改走分发。
+from atguigu.tool.bgem3_tool import get_bgem3_embedding
 from pymilvus import CollectionSchema
 from pymilvus import DataType
 from atguigu.tool.milvus_client_tool import get_milvus_client
