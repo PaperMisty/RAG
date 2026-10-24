@@ -30,6 +30,10 @@ navItems.forEach(item => {
         // 切换到问答界面时，自动聚焦输入框
         if (targetTab === 'tab-chat') {
             setTimeout(() => inputEl.focus(), 100);
+        } else if (targetTab === 'tab-observer') {
+            if (typeof loadObserverFolders === 'function') {
+                loadObserverFolders(true);
+            }
         }
     });
 });
@@ -287,12 +291,15 @@ function addUserMsgWithTime(text, ts) {
 
 function addBotMsgWithTime(text, ts, imageUrls, messageKey) {
     const id = 'bot-his-' + Math.random().toString(36).slice(2);
+    const traceBtnHtml = (messageKey && !String(messageKey).startsWith('his-'))
+        ? `<button class="btn-jump-trace" onclick="jumpToTrace('${escapeHtml(messageKey)}')">🔍 查看 Trace</button>`
+        : '';
     const html = `
     <div class="msg bot" id="${id}">
       <div class="avatar bot">🤖</div>
       <div>
         <div class="bubble"><div class="answer"></div></div>
-        <div class="meta">${formatTime(ts)}</div>
+        <div class="meta">${formatTime(ts)}${traceBtnHtml}</div>
       </div>
     </div>
   `;
@@ -327,7 +334,7 @@ function addBotMsgSkeleton() {
     return document.getElementById(id);
 }
 
-function renderProgress(botMsgEl, doneList, runningList, status) {
+function renderProgress(botMsgEl, doneList, runningList, status, elapsed_s, stalled) {
     const details = botMsgEl.querySelector('details.progress');
     if (!details) return;
     const summary = details.querySelector('summary');
@@ -345,7 +352,19 @@ function renderProgress(botMsgEl, doneList, runningList, status) {
     };
     const displayStatus = statusMap[status] || status || 'unknown';
 
-    summary.textContent = `阶段进度（已完成 ${totalDone}，进行中 ${totalRun}，状态：${displayStatus}）`;
+    // Elapsed / stall display: nodes used to sit silent for 45-70 s
+    // with only the typing dots changing, which reads as a hang.
+    // The summary now always carries elapsed time, and once no event
+    // has arrived for 10 s it says so explicitly instead of staying quiet.
+    let summaryText = `阶段进度（已完成 ${totalDone}，进行中 ${totalRun}，状态：${displayStatus}`;
+    if (typeof elapsed_s === 'number') {
+        summaryText += `，已等待 ${Math.floor(elapsed_s)} 秒`;
+    }
+    if (stalled) {
+        summaryText += '，仍在处理';
+    }
+    summaryText += '）';
+    summary.textContent = summaryText;
 
     const lines = [
         ...done.map(x => `✅ ${x}`),
@@ -440,8 +459,25 @@ async function onSend() {
 
         const es = new EventSource(`${API_BASE}/stream/${task_id}`);
         let rawAnswerText = '';
+        // Waiting timer: the backend now heartbeats every 5 s, but the
+        // timer also covers a stalled connection (no event at all).
+        // It only rewrites the progress summary; it never aborts a
+        // query, because normal queries legitimately run past 2 minutes.
+        const taskStartAt = Date.now();
+        let lastEventAt = taskStartAt;
+        let lastDone = [];
+        let lastRunning = [];
+        let lastStatus = 'pending';
+        const markEvent = () => { lastEventAt = Date.now(); };
+        const elapsedSec = () => (Date.now() - taskStartAt) / 1000;
+        const waitTimer = setInterval(() => {
+            const stalled = (Date.now() - lastEventAt) / 1000 >= 10;
+            renderProgress(botMsgEl, lastDone, lastRunning, lastStatus, elapsedSec(), stalled);
+        }, 5000);
+        const stopWaiting = () => { if (waitTimer) clearInterval(waitTimer); };
 
         es.addEventListener('chunks', (e) => {
+            markEvent();
             try {
                 const chunks = JSON.parse(e.data || '[]');
                 if (currentTaskId) {
@@ -453,11 +489,28 @@ async function onSend() {
             } catch (_) {}
         });
 
-        es.addEventListener('progress', (e) => {
+        es.addEventListener('heartbeat', (e) => {
+            markEvent();
             try {
                 const d = JSON.parse(e.data || '{}');
-                renderProgress(botMsgEl, d.done_list, d.running_list, d.status);
+                lastDone = d.done_list || lastDone;
+                lastRunning = d.running_list || lastRunning;
+                lastStatus = d.status || lastStatus;
+                const elapsed = (typeof d.elapsed_s === 'number') ? d.elapsed_s : elapsedSec();
+                renderProgress(botMsgEl, lastDone, lastRunning, lastStatus, elapsed, true);
+            } catch (_) {}
+        });
+
+        es.addEventListener('progress', (e) => {
+            markEvent();
+            try {
+                const d = JSON.parse(e.data || '{}');
+                lastDone = d.done_list || [];
+                lastRunning = d.running_list || [];
+                lastStatus = d.status || lastStatus;
+                renderProgress(botMsgEl, lastDone, lastRunning, lastStatus, elapsedSec(), false);
                 if (d && d.status === 'completed') {
+                    stopWaiting();
                     const typing = botMsgEl.querySelector('.typing');
                     if (typing) typing.remove();
                     sendBtn.disabled = false;
@@ -466,6 +519,7 @@ async function onSend() {
         });
 
         es.addEventListener('delta', (e) => {
+            markEvent();
             try {
                 const d = JSON.parse(e.data || '{}');
                 const delta = d.delta || '';
@@ -478,6 +532,7 @@ async function onSend() {
         });
 
         es.addEventListener('final', (e) => {
+            stopWaiting();
             const typing = botMsgEl.querySelector('.typing');
             if (typing) typing.remove();
 
@@ -506,6 +561,16 @@ async function onSend() {
                 const finalText = (d && typeof d.answer === 'string' && d.answer.trim().length > 0) ? d.answer : (rawAnswerText || answerEl.textContent || '');
                 renderAnswerWithImages(answerEl, finalText, d.image_urls || [], currentTaskId);
             } catch (_) {}
+
+            if (currentTaskId) {
+                const metaEl = botMsgEl.querySelector('.meta');
+                if (metaEl && !metaEl.querySelector('.btn-jump-trace')) {
+                    metaEl.insertAdjacentHTML(
+                        'beforeend',
+                        `<button class="btn-jump-trace" onclick="jumpToTrace('${escapeHtml(currentTaskId)}')">🔍 查看 Trace</button>`
+                    );
+                }
+            }
             
             es.close();
             sendBtn.disabled = false;
@@ -513,20 +578,30 @@ async function onSend() {
         });
 
         es.addEventListener('error', (e) => {
+            stopWaiting();
             const typing = botMsgEl.querySelector('.typing');
             if (typing) typing.remove();
-            
+
             const progress = botMsgEl.querySelector('details.progress');
             if (progress) progress.removeAttribute('open');
 
+            // The backend now puts one readable sentence in data.error
+            // (see main_service._readable_error); a bare browser
+            // EventSource error has no data and keeps the generic text.
+            // Never render a raw traceback or credential here.
+            let msg = 'SSE 连接中断/失败';
             try {
-                const msg = e && e.data ? (JSON.parse(e.data).error || 'SSE 连接中断/失败') : 'SSE 连接中断/失败';
+                if (e && e.data) {
+                    const parsed = JSON.parse(e.data);
+                    if (parsed && parsed.error) msg = parsed.error;
+                }
+            } catch (_) {}
+            if (rawAnswerText) {
                 rawAnswerText += `\n\n（错误：${msg}）`;
-                renderAnswerWithImages(answerEl, rawAnswerText, [], currentTaskId);
-            } catch (_) {
-                rawAnswerText += `\n\n（错误：SSE 连接中断/失败）`;
-                renderAnswerWithImages(answerEl, rawAnswerText, [], currentTaskId);
+            } else {
+                rawAnswerText = `（错误：${msg}）`;
             }
+            renderAnswerWithImages(answerEl, rawAnswerText, [], currentTaskId);
             es.close();
             sendBtn.disabled = false;
         });
@@ -859,3 +934,659 @@ loadHistory();
 setTimeout(() => inputEl.focus(), 200);
 // 设定定时心跳检查
 setInterval(apiHealth, 10000);
+
+
+// ====================================================================
+// ---------------- RAG 链路观测层 (Trace Observer) 逻辑 ----------------
+// ====================================================================
+
+const obsFolderListEl = document.getElementById('obsFolderList');
+const obsCanvasEl = document.getElementById('obsCanvas');
+const obsSummaryPillEl = document.getElementById('obsSummaryPill');
+const obsSearchInputEl = document.getElementById('obsSearchInput');
+const btnRefreshTracesEl = document.getElementById('btnRefreshTraces');
+
+let cachedObserverFolders = [];
+let selectedTraceId = null;
+let selectedFolderHour = null;
+
+function formatMs(ms) {
+    const val = Number(ms || 0);
+    if (val <= 0) return '0.0ms';
+    if (val < 1000) return `${val.toFixed(1)}ms`;
+    return `${(val / 1000).toFixed(2)}s (${Math.round(val)}ms)`;
+}
+
+function getRouteLabelText(routeKey) {
+    const map = {
+        'high_hybrid': '高置信·混合检索',
+        'medium_clarify': '中置信·澄清反问',
+        'low_web_only': '低置信·网络搜索',
+    };
+    return map[routeKey] || routeKey || '未知路由';
+}
+
+// 从对话气泡一键跳转到第三栏观测层并打开指定 Trace
+window.jumpToTrace = async function(traceId) {
+    if (!traceId) return;
+    navItems.forEach(nav => nav.classList.remove('active'));
+    tabPanes.forEach(pane => pane.classList.remove('active'));
+
+    const obsNav = document.querySelector('.nav-item[data-tab="tab-observer"]');
+    const obsPane = document.getElementById('tab-observer');
+    if (obsNav) obsNav.classList.add('active');
+    if (obsPane) obsPane.classList.add('active');
+
+    selectedTraceId = traceId;
+    await loadObserverFolders(true);
+    await selectTrace(traceId, null);
+};
+
+async function loadObserverFolders(preserveSelection = true) {
+    if (!obsFolderListEl) return;
+    try {
+        const res = await fetch(`${API_BASE}/observer/folders`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        cachedObserverFolders = Array.isArray(data.folders) ? data.folders : [];
+
+        if (obsSummaryPillEl) {
+            obsSummaryPillEl.textContent = `共 ${data.total_folders || 0} 个时段 · ${data.total_traces || 0} 条 Trace`;
+        }
+
+        renderObserverFolderTree(obsSearchInputEl ? obsSearchInputEl.value : '');
+
+        // 若尚未选中任何 Trace 且列表非空，默认自动加载最新一条 Trace
+        if ((!preserveSelection || !selectedTraceId) && cachedObserverFolders.length > 0) {
+            const firstFolder = cachedObserverFolders[0];
+            if (firstFolder.traces && firstFolder.traces.length > 0) {
+                const latest = firstFolder.traces[0];
+                await selectTrace(latest.trace_id, firstFolder.folder_hour);
+            }
+        }
+    } catch (e) {
+        console.error('加载观测层目录失败:', e);
+        obsFolderListEl.innerHTML = `<div class="obs-empty-hint">加载失败: ${escapeHtml(e.message || e)}</div>`;
+    }
+}
+
+function renderObserverFolderTree(keyword = '') {
+    if (!obsFolderListEl) return;
+    const kw = String(keyword || '').trim().toLowerCase();
+
+    if (!cachedObserverFolders || cachedObserverFolders.length === 0) {
+        obsFolderListEl.innerHTML = `<div class="obs-empty-hint">暂无 Trace 归档记录<br><small>在“智能对话”发送问题后将自动按 yy-mm-dd:hh 归档</small></div>`;
+        return;
+    }
+
+    let html = '';
+    cachedObserverFolders.forEach((folderObj, fIdx) => {
+        const folderName = folderObj.folder_hour || 'unknown';
+        const traces = Array.isArray(folderObj.traces) ? folderObj.traces : [];
+        const filtered = traces.filter(t => {
+            if (!kw) return true;
+            const hay = `${t.original_query} ${t.rewritten_query} ${(t.item_names || []).join(' ')} ${t.trace_id}`.toLowerCase();
+            return hay.includes(kw);
+        });
+
+        if (filtered.length === 0) return;
+
+        const hasSelected = filtered.some(t => t.trace_id === selectedTraceId);
+        const isOpen = fIdx === 0 || hasSelected || kw.length > 0;
+
+        html += `
+        <div class="obs-folder-group ${isOpen ? 'open' : ''}">
+            <div class="obs-folder-header" onclick="this.parentElement.classList.toggle('open')">
+                <div class="obs-folder-title">
+                    <span>📁</span>
+                    <span>${escapeHtml(folderName)}</span>
+                </div>
+                <span class="obs-folder-count">${filtered.length}</span>
+            </div>
+            <div class="obs-folder-items">
+        `;
+
+        filtered.forEach(item => {
+            const isActive = item.trace_id === selectedTraceId;
+            const timePart = (item.created_at || '').split(' ')[1] || item.created_at || '';
+            const scoreStr = typeof item.confidence_score === 'number' ? item.confidence_score.toFixed(2) : '0.00';
+            const routeCls = item.route_taken || 'high_hybrid';
+            const safeId = escapeHtml(item.trace_id);
+            const safeFolder = escapeHtml(folderName);
+
+            html += `
+                <div class="obs-trace-item ${isActive ? 'active' : ''}" data-trace-id="${safeId}" onclick="selectTrace('${safeId}', '${safeFolder}')">
+                    <div class="obs-trace-query" title="${escapeHtml(item.original_query || '')}">
+                        ${escapeHtml(item.original_query || '（空查询）')}
+                    </div>
+                    <div class="obs-trace-meta">
+                        <span>🕒 ${escapeHtml(timePart)}</span>
+                        <span class="obs-route-tag ${escapeHtml(routeCls)}">${escapeHtml(getRouteLabelText(routeCls))} (${scoreStr})</span>
+                        <span>⏱ ${formatMs(item.total_duration_ms)}</span>
+                    </div>
+                </div>
+            `;
+        });
+
+        html += `</div></div>`;
+    });
+
+    obsFolderListEl.innerHTML = html || `<div class="obs-empty-hint">未找到匹配 "${escapeHtml(keyword)}" 的 Trace</div>`;
+}
+
+window.selectTrace = async function(traceId, folderHour) {
+    if (!traceId || !obsCanvasEl) return;
+    selectedTraceId = traceId;
+    if (folderHour) selectedFolderHour = folderHour;
+
+    // 更新左侧高亮态
+    document.querySelectorAll('.obs-trace-item').forEach(el => {
+        if (el.getAttribute('data-trace-id') === traceId) {
+            el.classList.add('active');
+        } else {
+            el.classList.remove('active');
+        }
+    });
+
+    obsCanvasEl.innerHTML = `<div class="obs-placeholder"><div class="obs-placeholder-icon">⏳</div><h3>正在加载 Trace (${escapeHtml(traceId.slice(0, 8))}...)</h3></div>`;
+
+    try {
+        const qParam = folderHour ? `?folder=${encodeURIComponent(folderHour)}` : '';
+        const res = await fetch(`${API_BASE}/observer/trace/${encodeURIComponent(traceId)}${qParam}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const traceData = await res.json();
+        renderTraceCanvas(traceData);
+    } catch (e) {
+        console.error('加载单条 Trace 详情失败:', e);
+        obsCanvasEl.innerHTML = `<div class="obs-placeholder"><div class="obs-placeholder-icon">⚠️</div><h3>无法加载 Trace 详情</h3><p>${escapeHtml(e.message || e)}</p></div>`;
+    }
+};
+
+// 渲染每个模块方格正下方的耗时与网络 IO 铭牌
+function renderModuleTimingBar(timingObj, fallbackDesc = '') {
+    const t = timingObj || {};
+    const totalMs = Number(t.total_ms || 0);
+    const ioList = Array.isArray(t.io_breakdown) ? t.io_breakdown : [];
+
+    let chipsHtml = '';
+    if (ioList.length > 0) {
+        ioList.forEach(io => {
+            const ioType = io.io_type || 'network';
+            const iconMap = {
+                'network': '🌐',
+                'llm': '🤖',
+                'db': '🗄️',
+                'cpu': '⚡',
+            };
+            const icon = iconMap[ioType] || '🌐';
+            const detailStr = io.detail ? ` (${io.detail})` : '';
+            chipsHtml += `
+                <span class="timing-io-chip io-${escapeHtml(ioType)}" title="${escapeHtml(io.name + detailStr)}">
+                    ${icon} ${escapeHtml(io.name)}: <strong>${formatMs(io.duration_ms)}</strong>${escapeHtml(detailStr)}
+                </span>
+            `;
+        });
+    } else if (fallbackDesc) {
+        chipsHtml = `<span class="timing-io-chip io-cpu">ℹ️ ${escapeHtml(fallbackDesc)}</span>`;
+    } else {
+        chipsHtml = `<span class="timing-io-chip io-cpu">⚡ 无远程网络 IO</span>`;
+    }
+
+    return `
+        <div class="trace-module-timing-bar">
+            <div class="timing-total-badge">
+                ⏱ 模块总耗时: ${formatMs(totalMs)}
+            </div>
+            <div class="timing-io-list">
+                ${chipsHtml}
+            </div>
+        </div>
+    `;
+}
+
+// 渲染模块之间的虚线连接器
+function renderDashedConnector(label = '', isGrayed = false) {
+    const labelHtml = label ? `<span class="connector-label">${escapeHtml(label)}</span>` : '';
+    return `
+        <div class="trace-dashed-connector ${isGrayed ? 'is-grayed' : ''}">
+            <div class="dashed-line"></div>
+            ${labelHtml}
+            <div class="connector-arrow">▼</div>
+        </div>
+    `;
+}
+
+// 批量展开/收拢某个模块下的所有 Chunk 卡片
+window.toggleAllChunksInBox = function(btnEl, containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    const cards = container.querySelectorAll('.chunk-card');
+    const anyCollapsed = Array.from(cards).some(c => !c.classList.contains('is-expanded'));
+    cards.forEach(c => {
+        if (anyCollapsed) {
+            c.classList.add('is-expanded');
+        } else {
+            c.classList.remove('is-expanded');
+        }
+    });
+    btnEl.textContent = anyCollapsed ? '🔼 全部收拢' : '🔽 全部展开';
+};
+
+// 渲染可展开/收拢的排名 Chunks 列表（支持 RRF 灰化、断崖分割线与断崖灰化）
+function renderChunkListHtml(chunks, listId, mode = 'standard', extraConfig = {}) {
+    if (!Array.isArray(chunks) || chunks.length === 0) {
+        return `<div class="obs-empty-hint" style="padding:18px;">该阶段无切片数据（未触发或返回为空）</div>`;
+    }
+
+    let html = `<div class="chunk-rank-list" id="${escapeHtml(listId)}">`;
+    let cliffDividerInserted = false;
+
+    chunks.forEach((ch, idx) => {
+        const rank = ch.rank || (idx + 1);
+        const isGray = Boolean(ch.is_grayed);
+        const scoreVal = typeof ch.score === 'number' ? ch.score.toFixed(4) : '0.0000';
+        const title = ch.file_title || ch.item_name || '未知来源';
+        const section = ch.section_title ? ` · ${ch.section_title}` : '';
+        const rawContent = String(ch.content || '');
+        const preview = rawContent.replace(/\s+/g, ' ').slice(0, 75) + (rawContent.length > 75 ? '...' : '');
+
+        // 断崖检测模式下：渲染相邻切片分差气泡 & 断崖红色虚线分割线
+        if (mode === 'cliff' && idx > 0) {
+            const absGap = typeof ch.abs_gap === 'number' ? ch.abs_gap.toFixed(4) : '-';
+            const ratioGap = typeof ch.ratio_gap === 'number' ? (ch.ratio_gap * 100).toFixed(1) + '%' : '-';
+            html += `
+                <div class="cliff-gap-pill-row">
+                    <span class="cliff-gap-pill">↕ 相邻分差: Δabs = ${absGap} | Δratio = ${ratioGap}</span>
+                </div>
+            `;
+        }
+
+        if (mode === 'cliff' && isGray && !cliffDividerInserted) {
+            cliffDividerInserted = true;
+            const reasonText = extraConfig.trigger_reason || ch.gray_reason || '达到断崖阈值，后续切片被截断淘汰';
+            html += `
+                <div class="cliff-cutoff-divider">
+                    <span>✂️ 断崖截断线：${escapeHtml(reasonText)}</span>
+                    <span>以下切片标记为灰色（不送入大模型）</span>
+                </div>
+            `;
+        }
+
+        if (mode === 'rrf' && isGray && !cliffDividerInserted) {
+            cliffDividerInserted = true;
+            const topK = extraConfig.top_k || 10;
+            html += `
+                <div class="cliff-cutoff-divider" style="border-color:#94a3b8;background:#f1f5f9;color:#475569;">
+                    <span>📉 RRF Top-${escapeHtml(String(topK))} 截断线</span>
+                    <span>以下切片被挤在 Top-${escapeHtml(String(topK))} 后面（标记灰色）</span>
+                </div>
+            `;
+        }
+
+        // 来源排名辅助角标（如在 RRF 或 Reranker 中展示前序排名）
+        let srcBadges = '';
+        if (mode === 'rrf') {
+            if (ch.dense_rank) srcBadges += `<span class="chunk-src-rank-tag">Dense #${ch.dense_rank}</span>`;
+            if (ch.sparse_rank) srcBadges += `<span class="chunk-src-rank-tag">Sparse #${ch.sparse_rank}</span>`;
+            if (ch.hyde_rank) srcBadges += `<span class="chunk-src-rank-tag">HyDE #${ch.hyde_rank}</span>`;
+        } else if ((mode === 'reranker' || mode === 'cliff') && ch.rrf_rank) {
+            const diff = ch.rrf_rank - rank;
+            const diffStr = diff > 0 ? `↑+${diff}` : (diff < 0 ? `↓${diff}` : '=');
+            srcBadges += `<span class="chunk-src-rank-tag">RRF #${ch.rrf_rank} (${diffStr})</span>`;
+        }
+
+        let grayBadge = '';
+        if (isGray) {
+            const badgeText = mode === 'rrf' ? '未进 Top-K (已置灰)' : '已断崖淘汰 (已置灰)';
+            grayBadge = `<span class="chunk-gray-tag">${escapeHtml(badgeText)}</span>`;
+        }
+
+        html += `
+            <div class="chunk-card ${isGray ? 'is-grayed' : ''}">
+                <div class="chunk-card-header" onclick="this.parentElement.classList.toggle('is-expanded')">
+                    <span class="chunk-rank-badge">#${rank}</span>
+                    <div class="chunk-main-info">
+                        <div class="chunk-title-row">
+                            <span class="chunk-title-text">${escapeHtml(title)}${escapeHtml(section)}</span>
+                            ${srcBadges}
+                            ${grayBadge}
+                        </div>
+                        <div class="chunk-preview-text">${escapeHtml(preview || '（无正文内容）')}</div>
+                    </div>
+                    <div class="chunk-right-meta">
+                        <span class="chunk-score-badge">score: ${scoreVal}</span>
+                        <span class="chunk-expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="chunk-card-detail">
+                    <div class="chunk-detail-meta-bar">
+                        <span>🆔 Chunk ID: ${escapeHtml(ch.chunk_id || '-')}</span>
+                        <span>🏷️ 主体: ${escapeHtml(ch.item_name || '-')}</span>
+                        <span>📂 来源: ${escapeHtml(ch.source || 'local')}</span>
+                        ${ch.gray_reason ? `<span>⚠️ 灰化原因: ${escapeHtml(ch.gray_reason)}</span>` : ''}
+                    </div>
+                    <div class="md-content">${formatChunkToHtml(rawContent)}</div>
+                </div>
+            </div>
+        `;
+    });
+
+    html += `</div>`;
+    return html;
+}
+
+function renderTraceCanvas(trace) {
+    if (!obsCanvasEl || !trace) return;
+
+    const qMod = trace.query_module || {};
+    const rMod = trace.router_module || {};
+    const retMod = trace.retrieval_module || {};
+    const rrfMod = trace.rrf_module || {};
+    const rerankMod = trace.reranker_module || {};
+    const cliffMod = trace.cliff_module || {};
+    const outMod = trace.output_module || {};
+
+    const routeTaken = rMod.route_taken || 'high_hybrid';
+    const isHighRoute = routeTaken === 'high_hybrid';
+    const confScore = Number(rMod.confidence_score || 0);
+    const confPct = Math.min(Math.max(confScore * 100, 0), 100);
+    const barColor = confScore >= 0.8 ? '#16a34a' : (confScore > 0.6 ? '#f59e0b' : '#64748b');
+
+    // 1. 关键词与主体胶囊
+    const kwPills = (qMod.key_words || []).length > 0
+        ? qMod.key_words.map(k => `<span class="obs-tag-pill kw-pill">🔑 ${escapeHtml(k)}</span>`).join('')
+        : `<span class="obs-tag-pill raw-item-pill">无提取关键词</span>`;
+
+    const alignedItems = (qMod.aligned_item_names || []).length > 0
+        ? qMod.aligned_item_names.map(n => `<span class="obs-tag-pill item-pill">✅ ${escapeHtml(n)}</span>`).join('')
+        : `<span class="obs-tag-pill raw-item-pill">未对齐到高置信知识库主体</span>`;
+
+    const rawItems = (qMod.extracted_item_names || []).length > 0
+        ? qMod.extracted_item_names.map(n => `<span class="obs-tag-pill raw-item-pill">LLM提取: ${escapeHtml(n)}</span>`).join('')
+        : '';
+
+    // 2. 候选主体得分表
+    const candidates = Array.isArray(rMod.matched_candidates) ? rMod.matched_candidates : [];
+    const candPills = candidates.length > 0
+        ? candidates.slice(0, 6).map(c => `<span class="obs-tag-pill ${c.score >= 0.8 ? 'item-pill' : 'raw-item-pill'}">${escapeHtml(c.item_name)}: ${Number(c.score).toFixed(3)}</span>`).join('')
+        : `<span class="obs-tag-pill raw-item-pill">Milvus 无候选匹配项</span>`;
+
+    // 3. 三条路由线渲染（命中路线高亮，其余两条置灰）
+    const routesList = Array.isArray(rMod.routes) && rMod.routes.length > 0 ? rMod.routes : [
+        { route_key: 'high_hybrid', label: '高置信度路由 (score ≥ 0.8)', condition: '走混合检索 (Dense + Sparse + HyDE)', is_active: routeTaken === 'high_hybrid', target_desc: '进入 Dense/Sparse 检索 → RRF → Reranker → 断崖检测' },
+        { route_key: 'medium_clarify', label: '中置信度路由 (0.6 < score < 0.8)', condition: '多候选主体澄清反问', is_active: routeTaken === 'medium_clarify', target_desc: '跳过向量切片检索，直接生成澄清选项卡' },
+        { route_key: 'low_web_only', label: '低置信度路由 (score ≤ 0.6)', condition: '纯网络搜索兜底', is_active: routeTaken === 'low_web_only', target_desc: '跳过本地知识库，仅走 Tavily 网络搜索回答' },
+    ];
+
+    const branchesHtml = routesList.map(b => {
+        const activeCls = b.is_active ? 'is-active' : 'is-grayed';
+        const statusText = b.is_active ? '⚡ 实际执行路由' : '⚪ 未命中 (已置灰)';
+        return `
+            <div class="router-branch-col ${activeCls}">
+                <div class="router-branch-line-top"></div>
+                <div class="router-branch-card">
+                    <div class="router-branch-head">
+                        <span>${escapeHtml(b.label)}</span>
+                        <span class="router-status-pill">${statusText}</span>
+                    </div>
+                    <div class="router-branch-desc">
+                        <div><strong>条件：</strong>${escapeHtml(b.condition || '')}</div>
+                        <div style="margin-top:4px;"><strong>流向：</strong>${escapeHtml(b.target_desc || '')}</div>
+                    </div>
+                </div>
+                <div class="router-branch-line-bottom"></div>
+            </div>
+        `;
+    }).join('');
+
+    const html = `
+    <div class="obs-flow-container">
+        <!-- 顶部概览横幅 -->
+        <div class="trace-banner">
+            <div class="trace-banner-left">
+                <span class="trace-folder-badge">📁 归档目录: ${escapeHtml(trace.folder_hour || '-')}</span>
+                <span class="trace-id-badge">🆔 Trace: ${escapeHtml(trace.trace_id || '-')}</span>
+                <span class="trace-id-badge">🕒 ${escapeHtml(trace.created_at || '-')}</span>
+            </div>
+            <div class="trace-total-time-badge">
+                🏁 端到端总耗时: ${formatMs(trace.total_duration_ms)}
+            </div>
+        </div>
+
+        <!-- ==================== 模块 1：Query 理解与改写 ==================== -->
+        <div class="trace-module-wrap">
+            <div class="trace-module-box">
+                <div class="trace-module-header">
+                    <div class="trace-module-title">
+                        <span class="trace-step-num">1</span>
+                        <span>Query 理解、改写与主体提取模块 (Query & Intent Extraction)</span>
+                    </div>
+                    <span class="obs-tag-pill raw-item-pill">历史上下文: ${escapeHtml(String(qMod.history_turns || 0))} 条</span>
+                </div>
+                <div class="trace-module-body">
+                    <div class="query-fields-grid">
+                        <div class="query-field-card">
+                            <div class="query-field-label"><span>💬 原始 Query (original_query)</span></div>
+                            <div class="query-field-val">${escapeHtml(qMod.original_query || '-')}</div>
+                        </div>
+                        <div class="query-field-card">
+                            <div class="query-field-label"><span>✍️ 改写后 Query (rewritten_query)</span></div>
+                            <div class="query-field-val" style="color:#92400e;">${escapeHtml(qMod.rewritten_query || '-')}</div>
+                        </div>
+                        <div class="query-field-card">
+                            <div class="query-field-label"><span>🔑 提取关键词 (key_words)</span></div>
+                            <div class="tag-pills-wrap">${kwPills}</div>
+                        </div>
+                        <div class="query-field-card">
+                            <div class="query-field-label"><span>🏷️ 识别商品主体 (item_name)</span></div>
+                            <div class="tag-pills-wrap">${alignedItems} ${rawItems}</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            ${renderModuleTimingBar(qMod.timing)}
+        </div>
+
+        ${renderDashedConnector('虚线传递: rewritten_query + item_names')}
+
+        <!-- ==================== 模块 2：置信度评估与三路路由线 ==================== -->
+        <div class="trace-module-wrap">
+            <div class="trace-module-box">
+                <div class="trace-module-header">
+                    <div class="trace-module-title">
+                        <span class="trace-step-num">2</span>
+                        <span>主体置信度分数与实际路由分支 (Confidence Score & Routing Lines)</span>
+                    </div>
+                    <span class="obs-route-tag ${escapeHtml(routeTaken)}" style="font-size:12px;padding:3px 10px;">
+                        当前激活: ${escapeHtml(getRouteLabelText(routeTaken))}
+                    </span>
+                </div>
+                <div class="trace-module-body">
+                    <div class="confidence-meter-row">
+                        <div class="confidence-score-big">
+                            <span class="score-label">最高匹配置信度分数</span>
+                            <span class="score-num" style="color:${barColor};">${confScore.toFixed(4)}</span>
+                        </div>
+                        <div class="confidence-bar-wrap">
+                            <div class="confidence-bar-track">
+                                <div class="confidence-bar-fill" style="width:${confPct}%;background:${barColor};"></div>
+                            </div>
+                            <div class="confidence-scale-marks">
+                                <span>0.0 (无匹配)</span>
+                                <span>0.6 (低/中置信度阈值)</span>
+                                <span>0.8 (高置信度阈值)</span>
+                                <span>1.0</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <span style="font-size:12px;font-weight:700;color:#8d7a6b;margin-right:8px;">📊 Milvus 候选物料得分：</span>
+                        <div class="tag-pills-wrap" style="display:inline-flex;">${candPills}</div>
+                    </div>
+                    <!-- 三条虚线路由分支（命中分支高亮，其余两条灰色） -->
+                    <div class="router-branches-grid">
+                        ${branchesHtml}
+                    </div>
+                </div>
+            </div>
+            ${renderModuleTimingBar(rMod.timing)}
+        </div>
+
+        ${renderDashedConnector(isHighRoute ? '高置信混合检索路由激活 (双路并行召回)' : '当前路由跳过本地向量检索 (下游检索模块置灰)', !isHighRoute)}
+
+        <!-- ==================== 模块 3：Dense 检索与 Sparse 检索并列模块 ==================== -->
+        <div class="dual-retrieval-grid">
+            <!-- 3A: Dense 检索出来的 Chunks -->
+            <div class="trace-module-wrap ${isHighRoute ? '' : 'is-inactive-module'}">
+                <div class="trace-module-box">
+                    <div class="trace-module-header">
+                        <div class="trace-module-title">
+                            <span class="trace-step-num">3A</span>
+                            <span>Dense 稠密检索 Chunks (按 Cosine 排名)</span>
+                        </div>
+                        <div class="trace-module-actions">
+                            <span class="obs-folder-count">${(retMod.dense_chunks || []).length} 条</span>
+                            <button class="btn-fold-toggle" onclick="toggleAllChunksInBox(this, 'obs-dense-list')">🔽 全部展开</button>
+                        </div>
+                    </div>
+                    <div class="trace-module-body">
+                        ${renderChunkListHtml(retMod.dense_chunks || [], 'obs-dense-list', 'dense')}
+                    </div>
+                </div>
+                ${renderModuleTimingBar(retMod.dense_timing, '未执行 Dense 检索')}
+            </div>
+
+            <!-- 3B: Sparse 检索出来的 Chunks -->
+            <div class="trace-module-wrap ${isHighRoute ? '' : 'is-inactive-module'}">
+                <div class="trace-module-box">
+                    <div class="trace-module-header">
+                        <div class="trace-module-title">
+                            <span class="trace-step-num">3B</span>
+                            <span>Sparse 稀疏检索 Chunks (按 IP 排名)</span>
+                        </div>
+                        <div class="trace-module-actions">
+                            <span class="obs-folder-count">${(retMod.sparse_chunks || []).length} 条</span>
+                            <button class="btn-fold-toggle" onclick="toggleAllChunksInBox(this, 'obs-sparse-list')">🔽 全部展开</button>
+                        </div>
+                    </div>
+                    <div class="trace-module-body">
+                        ${renderChunkListHtml(retMod.sparse_chunks || [], 'obs-sparse-list', 'sparse')}
+                    </div>
+                </div>
+                ${renderModuleTimingBar(retMod.sparse_timing, '未执行 Sparse 检索')}
+            </div>
+        </div>
+
+        ${renderDashedConnector('双路召回切片汇入 RRF 倒排融合 (k=60)', !rrfMod.executed)}
+
+        <!-- ==================== 模块 4：RRF 之后的 Top-K 模块 ==================== -->
+        <div class="trace-module-wrap ${rrfMod.executed ? '' : 'is-inactive-module'}">
+            <div class="trace-module-box">
+                <div class="trace-module-header">
+                    <div class="trace-module-title">
+                        <span class="trace-step-num">4</span>
+                        <span>RRF 倒排融合 Top-${escapeHtml(String(rrfMod.top_k || 10))} (被挤在 Top-K 后面的标记灰色)</span>
+                    </div>
+                    <div class="trace-module-actions">
+                        <span class="obs-tag-pill item-pill">入围 Top-K: ${rrfMod.kept_count || 0} 条</span>
+                        <span class="obs-tag-pill raw-item-pill">尾部置灰: ${rrfMod.grayed_count || 0} 条</span>
+                        <button class="btn-fold-toggle" onclick="toggleAllChunksInBox(this, 'obs-rrf-list')">🔽 全部展开</button>
+                    </div>
+                </div>
+                <div class="trace-module-body">
+                    ${renderChunkListHtml(rrfMod.chunks || [], 'obs-rrf-list', 'rrf', { top_k: rrfMod.top_k || 10 })}
+                </div>
+            </div>
+            ${renderModuleTimingBar(rrfMod.timing, '未执行 RRF 模块')}
+        </div>
+
+        ${renderDashedConnector('RRF Top-K 切片 + Web 补充切片送入 Cross-Encoder 重排', !rerankMod.executed)}
+
+        <!-- ==================== 模块 5：Reranker 重排的 Chunks 模块 ==================== -->
+        <div class="trace-module-wrap ${rerankMod.executed ? '' : 'is-inactive-module'}">
+            <div class="trace-module-box">
+                <div class="trace-module-header">
+                    <div class="trace-module-title">
+                        <span class="trace-step-num">5</span>
+                        <span>Reranker 交叉编码重排 Chunks (按重排得分排名)</span>
+                    </div>
+                    <div class="trace-module-actions">
+                        <span class="obs-folder-count">共 ${(rerankMod.chunks || []).length} 条参与重排</span>
+                        <button class="btn-fold-toggle" onclick="toggleAllChunksInBox(this, 'obs-rerank-list')">🔽 全部展开</button>
+                    </div>
+                </div>
+                <div class="trace-module-body">
+                    ${renderChunkListHtml(rerankMod.chunks || [], 'obs-rerank-list', 'reranker')}
+                </div>
+            </div>
+            ${renderModuleTimingBar(rerankMod.timing, '未执行 Reranker 重排')}
+        </div>
+
+        ${renderDashedConnector('重排结果进入断崖检测 (绝对分差 > 0.25 或 相对分差 > 10%)', !cliffMod.executed)}
+
+        <!-- ==================== 模块 6：断崖检测的 Chunks 模块 ==================== -->
+        <div class="trace-module-wrap ${cliffMod.executed ? '' : 'is-inactive-module'}">
+            <div class="trace-module-box">
+                <div class="trace-module-header">
+                    <div class="trace-module-title">
+                        <span class="trace-step-num">6</span>
+                        <span>断崖检测 Chunks (Cliff Detection · 被断崖截断的切片标记灰色)</span>
+                    </div>
+                    <div class="trace-module-actions">
+                        <span class="obs-tag-pill item-pill">保留送入LLM: ${cliffMod.kept_count || 0} 条</span>
+                        <span class="obs-tag-pill raw-item-pill">被断崖标灰: ${cliffMod.dropped_count || 0} 条</span>
+                        <button class="btn-fold-toggle" onclick="toggleAllChunksInBox(this, 'obs-cliff-list')">🔽 全部展开</button>
+                    </div>
+                </div>
+                <div class="trace-module-body">
+                    <div style="margin-bottom:10px;font-size:12px;color:#786657;background:#faf7f0;padding:8px 12px;border-radius:6px;border:1px solid #e9dec4;">
+                        <strong>⚙️ 断崖参数：</strong>
+                        ABS_GAP_THRES = <code>${cliffMod.abs_gap_threshold ?? 0.25}</code> ·
+                        RATIO_GAP_THRES = <code>${cliffMod.ratio_gap_threshold ?? 0.10}</code> ·
+                        保留区间 = <code>[${cliffMod.min_len ?? 3}, ${cliffMod.max_len ?? 10}]</code> ·
+                        <strong>结论：</strong>${escapeHtml(cliffMod.trigger_reason || '未执行')}
+                    </div>
+                    ${renderChunkListHtml(cliffMod.chunks || [], 'obs-cliff-list', 'cliff', { trigger_reason: cliffMod.trigger_reason })}
+                </div>
+            </div>
+            ${renderModuleTimingBar(cliffMod.timing, '未执行断崖检测')}
+        </div>
+
+        ${renderDashedConnector('保留的上下文 Chunks 拼入 Prompt 送交大模型流式生成')}
+
+        <!-- ==================== 模块 7：最终模型的输出模块 ==================== -->
+        <div class="trace-module-wrap">
+            <div class="trace-module-box">
+                <div class="trace-module-header">
+                    <div class="trace-module-title">
+                        <span class="trace-step-num">7</span>
+                        <span>最终模型输出 (Final Model Answer Output)</span>
+                    </div>
+                    <div class="trace-module-actions">
+                        <span class="obs-tag-pill kw-pill">模式: ${escapeHtml(outMod.output_mode || 'rag_llm')}</span>
+                        <span class="obs-tag-pill item-pill">引用角标: ${(outMod.cited_chunk_ids || []).map(i => `[${i}]`).join(' ') || '无'}</span>
+                    </div>
+                </div>
+                <div class="trace-module-body">
+                    <div class="bubble" style="max-width:100%;width:100%;background:#fffdf9;">
+                        ${formatAnswerToHtml(outMod.final_answer || '（无输出内容）', trace.trace_id)}
+                    </div>
+                </div>
+            </div>
+            ${renderModuleTimingBar(outMod.timing)}
+        </div>
+    </div>
+    `;
+
+    obsCanvasEl.innerHTML = html;
+}
+
+if (btnRefreshTracesEl) {
+    btnRefreshTracesEl.addEventListener('click', () => loadObserverFolders(true));
+}
+
+if (obsSearchInputEl) {
+    obsSearchInputEl.addEventListener('input', (e) => {
+        renderObserverFolderTree(e.target.value || '');
+    });
+}

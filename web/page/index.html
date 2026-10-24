@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>掌柜智库</title>
     <!-- 引入高科技感统一独立样式表 -->
-    <link rel="stylesheet" href="/static/css/style.css?v=4.0">
+    <link rel="stylesheet" href="/static/css/style.css?v=5.0">
     <!-- 引入 Markdown 渲染解析库 marked.js -->
     <script src="/static/js/marked.min.js?v=4.0"></script>
 </head>
@@ -39,6 +39,9 @@
                 </li>
                 <li class="nav-item" data-tab="tab-import">
                     <span>📂</span> 知识库管理
+                </li>
+                <li class="nav-item" data-tab="tab-observer">
+                    <span>🔍</span> 链路观测
                 </li>
             </ul>
         </nav>
@@ -109,6 +112,38 @@
             </div>
         </div>
 
+        <!-- Tab 3: RAG 链路观测层面板 -->
+        <div class="tab-pane" id="tab-observer">
+            <div class="topbar">
+                <h2>🔍 RAG 链路观测层 (Trace Observer)</h2>
+                <div class="top-actions">
+                    <span class="obs-summary-pill" id="obsSummaryPill">共 0 个时段 · 0 条 Trace</span>
+                    <button class="btn btn-secondary" id="btnRefreshTraces">🔄 刷新列表</button>
+                </div>
+            </div>
+
+            <div class="observer-workspace">
+                <!-- 左侧：按 yy-mm-dd:hh 文件夹归类的 Trace 目录树 -->
+                <aside class="observer-tree-panel">
+                    <div class="obs-search-box">
+                        <input type="text" id="obsSearchInput" placeholder="搜索 Query / 主体 / Trace ID..." />
+                    </div>
+                    <div class="obs-folder-list" id="obsFolderList">
+                        <div class="obs-empty-hint">正在加载 Trace 归档目录...</div>
+                    </div>
+                </aside>
+
+                <!-- 右侧：单次 Trace 全链路虚线流图主画布 -->
+                <section class="observer-canvas" id="obsCanvas">
+                    <div class="obs-placeholder">
+                        <div class="obs-placeholder-icon">🧭</div>
+                        <h3>选择左侧一条 Trace 记录查看全链路观测图</h3>
+                        <p>按 <code>yy-mm-dd:hh</code> 归类 · 展示 Query 改写 · 置信度三路路由线 · Dense/Sparse 排名 · RRF TopK · Reranker · 断崖检测 · 模块网络 IO 耗时</p>
+                    </div>
+                </section>
+            </div>
+        </div>
+
     </main>
 </div>
 
@@ -138,6 +173,6 @@
 </div>
 
 <!-- 引入分离的前端主业务逻辑脚本 -->
-<script src="/static/js/app.js?v=4.1"></script>
+<script src="/static/js/app.js?v=5.0"></script>
 </body>
 </html>
