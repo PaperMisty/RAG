@@ -30,7 +30,7 @@ from atguigu.config.config import RAW_DIR, STATIC_DIR, OUTPUT_DIR, MinIOConfig
 from atguigu.import_process.main_graph import GraphRunner
 from atguigu.query_process.main_graph import QueryMainGraphRunner
 from atguigu.tool.minio_client_tool import get_minio_client
-from atguigu.tool.mongo_client_tool import clear_history, get_recent_history_list
+from atguigu.tool.mongo_client_tool import clear_history, get_recent_history_list, add_or_update_data
 from atguigu.tool.logger import logger
 
 app = FastAPI(
@@ -69,7 +69,7 @@ async def get_history(session_id: str = Path(..., description="会话ID")):
     """
     获取历史记录
     """
-    history_lst = get_recent_history_list(session_id, limit=10, reverse=False)
+    history_lst = get_recent_history_list(session_id, limit=100, reverse=False)  # 50 轮内刷新不丢旧轮；此前 limit=10 导致超 5 轮后旧消息在刷新后不可见
     for item in history_lst:
         item["_id"] = str(item["_id"])
     print("get", session_id)
@@ -114,6 +114,19 @@ def run_query_graph(task_id, original_query, session_id):
         sys.stderr.flush()
         update_task_status(task_id, TASK_STATUS_FAILED)
         q.put({"event": "error", "data": get_task_info(task_id)})
+        # 图在 AnswerOutput 写 assistant 之前失败时，Mongo 里只剩入口处写的 user 记录，
+        # 刷新后就是“只剩用户消息”。补一条失败提示记录（非编造答案），使刷新后可见失败态。
+        try:
+            add_or_update_data({
+                "session_id": session_id,
+                "task_id": task_id,
+                "role": "assistant",
+                "text": "（本次查询失败，未生成答案，请重试）",
+                "chunks": [],
+                "ts": time.time(),
+            })
+        except Exception:
+            pass
 
 
 @app.post("/query")
@@ -225,4 +238,4 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main_service:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main_service:app", host="127.0.0.1", port=8001, reload=True)

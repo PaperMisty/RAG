@@ -7,7 +7,8 @@ if (!sessionId) {
     sessionId = 'sess-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
     localStorage.setItem('kb_session_id', sessionId);
 }
-let currentSessionChunks = {}; // 全局缓存当前提问检索到的切片数据
+let chunksByMessage = {}; // 按消息（task_id，历史则为 _id）隔离的引用切片缓存：各轮 chunk id 均从 1 起重编，全局单 map 必然串轮
+let currentTaskId = null;
 
 // 获取常用 DOM 元素
 const apiPill = document.getElementById('apiPill');
@@ -145,13 +146,14 @@ function parseConfirmOptions(text) {
 }
 
 // 引用角标重编号：把答案中的 [[chunk_id]] 按首次出现顺序重编号为 [1][2]...（同一 chunk 复用同一编号，点击仍按 chunk_id 打开原文抽屉）
-function linkCitations(mdText) {
+function linkCitations(mdText, messageKey) {
     const seqByChunkId = new Map();
+    const safeKey = String(messageKey || '').replace(/'/g, "\\'");
     return mdText.replace(/\[\[(\d+)\]\]/g, (match, chunkId) => {
         if (!seqByChunkId.has(chunkId)) {
             seqByChunkId.set(chunkId, seqByChunkId.size + 1);
         }
-        return `<span class="citation-badge" onclick="openSourceDrawer('${chunkId}')">[${seqByChunkId.get(chunkId)}]</span>`;
+        return `<span class="citation-badge" onclick="openSourceDrawer('${safeKey}', '${chunkId}')">[${seqByChunkId.get(chunkId)}]</span>`;
     });
 }
 
@@ -173,7 +175,7 @@ function formatChunkToHtml(chunkText) {
     return escapeHtml(mdText).replace(/\r?\n/g, '<br>');
 }
 
-function formatAnswerToHtml(answerText) {
+function formatAnswerToHtml(answerText, messageKey) {
     if (!answerText) return '';
 
     // 检测是否为中等置信度确认列表，是则直接渲染为交互按钮卡片
@@ -220,7 +222,7 @@ function formatAnswerToHtml(answerText) {
     mdText = mdText.replace(imgRegex, (url) => `![图片](${url})`);
 
     // 3.5 识别引用标注 [[chunk_id]] 格式并替换为可点击的引用角标（按出现顺序重编号，见 linkCitations）
-    mdText = linkCitations(mdText);
+    mdText = linkCitations(mdText, messageKey);
 
     // 调用 marked 解析库解析 Markdown，如果未引入则 fallback 降级为普通文本
     let html = '';
@@ -233,8 +235,8 @@ function formatAnswerToHtml(answerText) {
     return html;
 }
 
-function renderAnswerWithImages(containerEl, answerText, candidateImageUrls) {
-    let htmlContent = formatAnswerToHtml(answerText || '');
+function renderAnswerWithImages(containerEl, answerText, candidateImageUrls, messageKey) {
+    let htmlContent = formatAnswerToHtml(answerText || '', messageKey);
 
     const candidates = Array.isArray(candidateImageUrls)
         ? candidateImageUrls.map(normalizeUrl).filter(isImageUrl)
@@ -283,7 +285,7 @@ function addUserMsgWithTime(text, ts) {
     scrollToBottom();
 }
 
-function addBotMsgWithTime(text, ts, imageUrls) {
+function addBotMsgWithTime(text, ts, imageUrls, messageKey) {
     const id = 'bot-his-' + Math.random().toString(36).slice(2);
     const html = `
     <div class="msg bot" id="${id}">
@@ -298,7 +300,7 @@ function addBotMsgWithTime(text, ts, imageUrls) {
     const el = document.getElementById(id);
     if (el) {
         const answerEl = el.querySelector('.answer');
-        renderAnswerWithImages(answerEl, text || '', imageUrls || []);
+        renderAnswerWithImages(answerEl, text || '', imageUrls || [], messageKey);
     }
     scrollToBottom();
 }
@@ -375,16 +377,19 @@ async function loadHistory() {
         const nodes = Array.from(chatEl.querySelectorAll('.msg'));
         for (let i = 1; i < nodes.length; i++) nodes[i].remove();
         
-        for (const item of items) {
+        chunksByMessage = {};
+        for (let hi = 0; hi < items.length; hi++) {
+            const item = items[hi];
             if (item.role === 'user') {
                 addUserMsgWithTime(item.text || '', item.ts);
             } else {
+                const messageKey = item.task_id || item._id || ('his-' + hi);
                 if (Array.isArray(item.chunks)) {
-                    item.chunks.forEach(c => {
-                        currentSessionChunks[c.id] = c;
-                    });
+                    const m = {};
+                    item.chunks.forEach(c => { m[c.id] = c; });
+                    chunksByMessage[messageKey] = m;
                 }
-                addBotMsgWithTime(item.text || '', item.ts, item.image_urls || []);
+                addBotMsgWithTime(item.text || '', item.ts, item.image_urls || [], messageKey);
             }
         }
         scrollToBottom();
@@ -412,7 +417,7 @@ async function submitQuery(text) {
 async function onSend() {
     const text = (inputEl.value || '').trim();
     if (!text) return;
-    currentSessionChunks = {}; // 新提问开始，清空上一轮的缓存切片，防止内存泄露和交叉干扰
+    // 新提问只建本轮的缓存键，不清空旧轮：旧轮角标仍需按本轮 task_id 之外的键解析
     inputEl.value = '';
     addUserMsg(text);
     const botMsgEl = addBotMsgSkeleton();
@@ -420,6 +425,8 @@ async function onSend() {
 
     try {
         const data = await submitQuery(text);
+        currentTaskId = data.task_id || null;
+        if (currentTaskId) chunksByMessage[currentTaskId] = {};
         renderProgress(botMsgEl, [], [], 'pending');
 
         const { task_id } = data;
@@ -437,9 +444,12 @@ async function onSend() {
         es.addEventListener('chunks', (e) => {
             try {
                 const chunks = JSON.parse(e.data || '[]');
-                chunks.forEach(c => {
-                    currentSessionChunks[c.id] = c;
-                });
+                if (currentTaskId) {
+                    if (!chunksByMessage[currentTaskId]) chunksByMessage[currentTaskId] = {};
+                    chunks.forEach(c => {
+                        chunksByMessage[currentTaskId][c.id] = c;
+                    });
+                }
             } catch (_) {}
         });
 
@@ -461,7 +471,7 @@ async function onSend() {
                 const delta = d.delta || '';
                 if (delta) {
                     rawAnswerText += delta;
-                    renderAnswerWithImages(answerEl, rawAnswerText, []);
+                    renderAnswerWithImages(answerEl, rawAnswerText, [], currentTaskId);
                     scrollToBottom();
                 }
             } catch (_) {}
@@ -494,7 +504,7 @@ async function onSend() {
             try {
                 const d = JSON.parse(e.data || '{}');
                 const finalText = (d && typeof d.answer === 'string' && d.answer.trim().length > 0) ? d.answer : (rawAnswerText || answerEl.textContent || '');
-                renderAnswerWithImages(answerEl, finalText, d.image_urls || []);
+                renderAnswerWithImages(answerEl, finalText, d.image_urls || [], currentTaskId);
             } catch (_) {}
             
             es.close();
@@ -512,10 +522,10 @@ async function onSend() {
             try {
                 const msg = e && e.data ? (JSON.parse(e.data).error || 'SSE 连接中断/失败') : 'SSE 连接中断/失败';
                 rawAnswerText += `\n\n（错误：${msg}）`;
-                renderAnswerWithImages(answerEl, rawAnswerText, []);
+                renderAnswerWithImages(answerEl, rawAnswerText, [], currentTaskId);
             } catch (_) {
                 rawAnswerText += `\n\n（错误：SSE 连接中断/失败）`;
-                renderAnswerWithImages(answerEl, rawAnswerText, []);
+                renderAnswerWithImages(answerEl, rawAnswerText, [], currentTaskId);
             }
             es.close();
             sendBtn.disabled = false;
@@ -805,11 +815,20 @@ const sourceDrawer = document.getElementById('sourceDrawer');
 const drawerOverlay = document.getElementById('drawerOverlay');
 const closeDrawerBtn = document.getElementById('closeDrawer');
 
-window.openSourceDrawer = function(chunkId) {
-    const chunk = currentSessionChunks[chunkId];
+window.openSourceDrawer = function(messageKey, chunkId) {
+    // 兼容旧式单参调用 openSourceDrawer(chunkId)：先按当前轮找，再兜底全量找；正常路径（带消息键）不走兜底。
+    if (chunkId === undefined) { chunkId = messageKey; messageKey = null; }
+    let chunk = null;
+    if (messageKey && chunksByMessage[messageKey]) chunk = chunksByMessage[messageKey][chunkId];
+    if (!chunk && currentTaskId && chunksByMessage[currentTaskId]) chunk = chunksByMessage[currentTaskId][chunkId];
     if (!chunk) {
-        console.warn(`[openSourceDrawer] 未在缓存中找到标号 [${chunkId}] 的切片信息。当前已缓存的切片 ID:`, Object.keys(currentSessionChunks));
-        alert(`未在本地缓存中找到标号 [${chunkId}] 对应的原文切片（该消息可能产生于持久化支持添加前，重新提问即可查看最新切片详情）。`);
+        for (const k of Object.keys(chunksByMessage)) {
+            if (chunksByMessage[k] && chunksByMessage[k][chunkId]) { chunk = chunksByMessage[k][chunkId]; break; }
+        }
+    }
+    if (!chunk) {
+        console.warn(`[openSourceDrawer] 未在缓存中找到消息 [${messageKey}] 的标号 [${chunkId}] 切片信息。`);
+        alert(`未在本地缓存中找到该轮标号 [${chunkId}] 对应的原文切片（该消息可能产生于持久化支持添加前，重新提问即可查看最新切片详情）。`);
         return;
     }
 
