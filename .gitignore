@@ -30,3 +30,7 @@ experiment
 
 # Deploy volumes
 deploy/volumes/
+# Service logs (persistent, rotated, never committed)
+logs/
+# Observer runtime traces
+observer/traces/
