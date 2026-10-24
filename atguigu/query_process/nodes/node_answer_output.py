@@ -36,6 +36,7 @@ class NodeAnswerOutput(NodeBase):
         # 构造mongodb对话结构
         data_dict = {
             "session_id": session_id,
+            "task_id": state.get("task_id"),
             "role": "assistant",
             "text": answer,
             "rewritten_query": rewritten_query,
@@ -52,6 +53,17 @@ class NodeAnswerOutput(NodeBase):
         # 置信度极低或主体未识别，网络搜索总结情况
         elif is_low_confidence:
             web_search_docs = state.get("web_search_docs", [])
+            if not web_search_docs:
+                # Tavily 失败/空结果且低置信：不进 LLM，直接回固定句，避免模型编造“网络搜索结果”。
+                answer = "[\u672a\u68c0\u7d22\u5230\u76f8\u5173\u4e3b\u4f53]"
+                q.put({"event": "chunks", "data": []})
+                q.put({"event": "delta", "data": {"delta": answer}})
+                q.put({"event": "final", "data": ""})
+                data_dict["text"] = answer
+                data_dict["chunks"] = []
+                insert_id = add_or_update_data(data_dict)
+                logger.info(f"低置信度且网络搜索无结果，直接返回固定句，未调用 LLM, id:{insert_id}")
+                return {"answer": answer}
             combine_content = ""
             for idx, doc in enumerate(web_search_docs, 1):
                 content = f'[{idx}][来源: {doc.get("title")}][网址: {doc.get("url")}]\n内容摘要: {doc.get("content")}\n\n'

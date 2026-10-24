@@ -1,79 +1,96 @@
 # atguigu/query_process/nodes/node_web_search_mcp.py
+"""Web search node, backed by Tavily Search API.
 
-import asyncio
-from atguigu.config.config import LLMConfig
-from atguigu.tool.json_format_tool import json_format
+This replaces the former Bailian MCP path: the agents MCP client handshake
+against the DashScope endpoint timed out at exactly 10s/60s, and no
+fallback to that MCP path is kept here. If Tavily fails, this node returns
+an empty list; the answer node decides what to do (low confidence -> fixed
+sentence, high confidence -> pure KB answer).
+"""
+
+import time
+
+import httpx
+
+from atguigu.config.config import TavilyConfig
 from atguigu.query_process.base import NodeBase
 from atguigu.query_process.state import QueryGraphState
+from atguigu.tool.json_format_tool import json_format
 from atguigu.tool.logger import logger
-from rich import print
-import json
-from atguigu.config.config import MCPConfig
-from agents.mcp import MCPServerStreamableHttp
 
 
 class NodeWebSearchMcp(NodeBase):
     """
-    节点功能，调用外部搜索引擎补充信息
+    节点功能，调用 Tavily 搜索补充信息。
+    （类名/文件名保留 node_web_search_mcp，避免改动图路由；后端已切 Tavily。）
     """
 
-    # 覆盖基类的 name 属性，标识节点名称
     name: str = "node_web_search_mcp"
 
     def process(self, state: QueryGraphState):
-        """
-        用MCP工具搜索重写问题的网络答案,结构化输出
-        :param state: 工作流状态对象
-        :return: 更新后的状态对象
-        """
-
         logger.info(f"【{self.name}】节点逻辑")
         rewritten_query = state.get("rewritten_query")
         if not rewritten_query:
             logger.error(f"【{self.name}】节点的处理数据为空")
             raise ValueError(f"【{self.name}】节点的处理数据为空")
+        try:
+            docs = self.tavily_search(rewritten_query)
+        except Exception as e:
+            # 不抛错、不回头走百炼 MCP：失败一律返回空列表，由答案节点按置信度分流。
+            logger.warning(f"【{self.name}】Tavily 搜索失败，返回空列表: {type(e).__name__}")
+            return {"web_search_docs": []}
+        if not docs:
+            logger.warning(f"【{self.name}】Tavily 搜索结果为空，返回空列表")
+        return {"web_search_docs": docs}
 
-        web_search_docs = asyncio.run(self.mcp_run(rewritten_query))
-        if not web_search_docs:
-            logger.warning(f"搜索结果为空")
-            raise ValueError("搜索结果为空")
-        # 取核心内容
-        web_search_docs = json.loads(web_search_docs.content[0].text).get("pages")
-        return {
-            "web_search_docs": [
-                {
-                    "title": item.get("title"),
-                    "content": item.get("snippet"),
-                    "url": item.get("url"),
-                    "source": "web",
-                }
-                for item in web_search_docs
-            ]
-        }
-
-    async def mcp_run(self, query, limit=10) -> None:
-        token = LLMConfig.api_key
-        url = MCPConfig.mcp_dashscope_base_url
-        async with MCPServerStreamableHttp(
-            name="Streamable HTTP Python Server",
-            params={
-                "url": url,
-                "headers": {"Authorization": f"Bearer {token}"},
-                "timeout": 10,
+    def tavily_search(self, query, limit=None):
+        api_key = TavilyConfig.api_key
+        if not api_key:
+            raise ValueError("Tavily API key 未配置")
+        max_results = limit or TavilyConfig.max_results
+        t0 = time.time()
+        resp = httpx.post(
+            TavilyConfig.base_url.rstrip("/") + "/search",
+            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+            json={
+                "query": query,
+                "search_depth": TavilyConfig.search_depth,
+                "max_results": max_results,
+                "include_answer": False,
+                "include_raw_content": False,
+                "include_images": False,
+                "include_usage": True,
             },
-            cache_tools_list=True,
-            max_retry_attempts=3,
-            client_session_timeout_seconds=30,
-        ) as server:
-            result = await server.call_tool("bailian_web_search", arguments={"query": query, "count": limit})
-            return result
+            timeout=TavilyConfig.timeout,
+        )
+        elapsed = time.time() - t0
+        if resp.status_code != 200:
+            # 只记状态码，不记响应体/key；额度耗尽(402/429)同样当作失败，不重试。
+            logger.warning(
+                f"【{self.name}】Tavily 搜索 HTTP 失败: status={resp.status_code} elapsed={elapsed:.2f}s"
+            )
+            return []
+        data = resp.json()
+        results = data.get("results") or []
+        usage = data.get("usage")
+        logger.info(
+            f"【{self.name}】Tavily 搜索完成: status=200 results={len(results)} "
+            f"elapsed={elapsed:.2f}s usage={usage}"
+        )
+        docs = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            content = (item.get("content") or item.get("snippet") or "").strip()
+            title = item.get("title") or ""
+            url = item.get("url") or ""
+            if not title and not url and not content:
+                continue
+            docs.append({"title": title, "content": content, "url": url, "source": "web"})
+        return docs
 
 
 if __name__ == "__main__":
-
-    init_state = {"rewritten_query": "关于BrotherHAK180烫金机如何使用"}
-
-    # 执行节点的业务调用
     node_web_search_mcp = NodeWebSearchMcp()
-    result = node_web_search_mcp(init_state)
+    result = node_web_search_mcp.process({"rewritten_query": "三诺生物2022年销售人员"})
     logger.info(json_format(result))

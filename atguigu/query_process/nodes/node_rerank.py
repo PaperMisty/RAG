@@ -68,11 +68,13 @@ class NodeRerank(NodeBase):
         rrf_chunks = state.get("rrf_chunks")
         web_search_docs = state.get("web_search_docs")
 
-        if not rrf_chunks or not web_search_docs or not rewritten_query:
+        # web 为补充分支（可能因 MCP 超时返回空），不能因 web 为空就否定已有的 KB 召回。
+        # 仅当 KB 与 web 双空（或无重写问题）才算无召回；合并池取各自现有的部分。
+        if (not rrf_chunks and not web_search_docs) or not rewritten_query:
             logger.error(f"没有召回结果: {rrf_chunks=},{web_search_docs=},{rewritten_query=}")
             raise ValueError(f"没有召回结果: {rrf_chunks=},{web_search_docs=},{rewritten_query=}")
 
-        merge_docs = rrf_chunks + web_search_docs
+        merge_docs = (rrf_chunks or []) + (web_search_docs or [])
         cleaned_docs = []
         for doc in merge_docs:
             content_val = doc.get("chunk_content") or doc.get("content")

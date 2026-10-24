@@ -90,6 +90,16 @@ class MCPConfig:
     mcp_dashscope_base_url = os.getenv("MCP_DASHSCOPE_BASE_URL")
 
 
+class TavilyConfig:
+    # Tavily Search API. Key is read from env only (.env tavily_key, or
+    # standard TAVILY_API_KEY); it must never be logged or hard-coded.
+    api_key = os.getenv("tavily_key") or os.getenv("TAVILY_API_KEY")
+    base_url = os.getenv("TAVILY_BASE_URL", "https://api.tavily.com")
+    search_depth = os.getenv("TAVILY_SEARCH_DEPTH", "basic")
+    max_results = int(os.getenv("TAVILY_MAX_RESULTS", "5") or "5")
+    timeout = float(os.getenv("TAVILY_TIMEOUT", "15") or "15")
+
+
 class ReRankerConfig:
     reranker_base_url = os.getenv("RERANK_BASE_URL")
     # 【Colab远程部署改造】自托管 Rerank 服务地址（TEI 的 /rerank 或 FastAPI 回退的 /v1/rerank），
