@@ -8,7 +8,9 @@ from atguigu.query_process.nodes.node_search_embedding import NodeSearchEmbeddin
 from atguigu.tool.json_format_tool import json_format
 from atguigu.query_process.base import NodeBase
 from atguigu.query_process.state import QueryGraphState
-from atguigu.tool.logger import logger
+from atguigu.tool.logger import logger, summarize_docs
+from observer.collector import trace_collector
+import time
 
 
 class NodeSearchEmbeddingHyde(NodeBase):
@@ -27,6 +29,8 @@ class NodeSearchEmbeddingHyde(NodeBase):
         :return: 更新后的状态对象
         """
 
+        task_id = state.get("task_id") or ""
+        t_start = time.perf_counter()
         item_names = state.get("item_names")
         rewritten_query = state.get("rewritten_query")
         if not item_names or not rewritten_query:
@@ -46,14 +50,25 @@ class NodeSearchEmbeddingHyde(NodeBase):
             {"role": "user", "content": PromptConfig.HYDE_PROMPT.format(rewritten_query=rewritten_query)},
         ]
 
+        t_llm = time.perf_counter()
         hybrid_answer = llm.invoke(input=msg).content
+        llm_io_ms = round((time.perf_counter() - t_llm) * 1000, 2)
 
+        t_search = time.perf_counter()
         hyde_embedding_chunks = NodeSearchEmbedding().search_chunks(
             f"问题:{rewritten_query}\n答案:{hybrid_answer}", item_names, source="local"
         )
+        search_io_ms = round((time.perf_counter() - t_search) * 1000, 2)
+
+        if task_id:
+            trace_collector.add_io_item(task_id, "hyde", "HyDE LLM 生成 IO", llm_io_ms, io_type="llm")
+            trace_collector.add_io_item(task_id, "hyde", "HyDE 向量化与Milvus检索 IO", search_io_ms, io_type="network")
+            trace_collector.set_module_total_ms(task_id, "hyde", (time.perf_counter() - t_start) * 1000)
+            trace_collector.add_io_item(task_id, "retrieval", "HyDE LLM 假想文档 IO", llm_io_ms, io_type="llm")
+            trace_collector.record_hyde_retrieval(task_id, hybrid_answer, hyde_embedding_chunks)
+
         # =========== 展示示例 ==========
-        logger.info(f"HyDE检索结果: {len(hyde_embedding_chunks)}")
-        logger.info(json_format(hyde_embedding_chunks[:2]))
+        logger.info(f"HyDE检索结果: {summarize_docs(hyde_embedding_chunks, limit=3)}")
         # return state
         return {"hyde_embedding_chunks": hyde_embedding_chunks}
 

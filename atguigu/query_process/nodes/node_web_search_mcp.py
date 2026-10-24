@@ -17,6 +17,7 @@ from atguigu.query_process.base import NodeBase
 from atguigu.query_process.state import QueryGraphState
 from atguigu.tool.json_format_tool import json_format
 from atguigu.tool.logger import logger
+from observer.collector import trace_collector
 
 
 class NodeWebSearchMcp(NodeBase):
@@ -29,13 +30,26 @@ class NodeWebSearchMcp(NodeBase):
 
     def process(self, state: QueryGraphState):
         logger.info(f"【{self.name}】节点逻辑")
+        task_id = state.get("task_id") or ""
+        t_start = time.perf_counter()
         rewritten_query = state.get("rewritten_query")
         if not rewritten_query:
             logger.error(f"【{self.name}】节点的处理数据为空")
             raise ValueError(f"【{self.name}】节点的处理数据为空")
         try:
-            docs = self.tavily_search(rewritten_query)
+            with trace_collector.track_io(task_id, "web", "Tavily Search HTTP IO", io_type="network"):
+                docs = self.tavily_search(rewritten_query)
+            web_io_ms = round((time.perf_counter() - t_start) * 1000, 2)
+            trace_collector.set_module_total_ms(task_id, "web", web_io_ms)
+            trace_collector.add_io_item(task_id, "retrieval", "Tavily 网络搜索 IO", web_io_ms, io_type="network")
+            trace_collector.record_web_retrieval(task_id, docs)
         except Exception as e:
+            web_io_ms = round((time.perf_counter() - t_start) * 1000, 2)
+            trace_collector.set_module_total_ms(task_id, "web", web_io_ms)
+            trace_collector.add_io_item(
+                task_id, "retrieval", "Tavily 网络搜索 IO (失败)", web_io_ms, io_type="network", status="error"
+            )
+            trace_collector.record_web_retrieval(task_id, [])
             # 不抛错、不回头走百炼 MCP：失败一律返回空列表，由答案节点按置信度分流。
             logger.warning(f"【{self.name}】Tavily 搜索失败，返回空列表: {type(e).__name__}")
             return {"web_search_docs": []}

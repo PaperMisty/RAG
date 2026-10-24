@@ -17,7 +17,26 @@ from rich import print
 from atguigu.query_process.base import NodeBase
 from atguigu.query_process.state import QueryGraphState
 from atguigu.tool.logger import logger
+from observer.collector import trace_collector
 from pydantic import BaseModel, Field
+import re
+
+
+def _extract_fallback_keywords(rewritten_query: str, item_names: list[str]) -> list[str]:
+    """职责: 当LLM未返回关键词时，从改写问题与主体名中提取高价值关键词兜底"""
+    kw_list: list[str] = []
+    for name in item_names or []:
+        if name and name not in kw_list:
+            kw_list.append(name)
+    # 提取型号/英文数字组合以及核心中文词块
+    tokens = re.findall(r"[A-Za-z0-9\-_]{2,}|[\u4e00-\u9fa5]{2,6}", rewritten_query or "")
+    stop_words = {"请问", "怎么", "如何", "什么", "哪些", "多少", "关于", "咨询", "一下", "可以", "是不是", "为什么"}
+    for tk in tokens:
+        if tk not in stop_words and tk not in kw_list:
+            kw_list.append(tk)
+        if len(kw_list) >= 6:
+            break
+    return kw_list
 
 
 class ItemNameExtractResult(BaseModel):
@@ -29,6 +48,10 @@ class ItemNameExtractResult(BaseModel):
     item_names: list[str] = Field(
         default_factory=list,
         description="从当前用户提问和整个历史会话上下文中，挖掘出当前正在讨论的主体商品/设备名称",
+    )
+    key_words: list[str] = Field(
+        default_factory=list,
+        description="从当前提问和改写后的问题中提取出的2-5个核心检索关键词（包含产品名、型号、属性或动作词）",
     )
 
 
@@ -48,13 +71,49 @@ class NodeItemNameConfirm(NodeBase):
         """
 
         logger.info(f"【{self.name}】节点逻辑")
-        # 1. 获取基本对话信息
-        context, original_query, message_id, session_id = self.get_history_context(state)
+        task_id = state.get("task_id") or ""
+        if task_id and trace_collector.get_trace(task_id) is None:
+            trace_collector.start_trace(
+                task_id=task_id,
+                original_query=state.get("original_query", ""),
+                session_id=state.get("session_id", ""),
+            )
+
+        # 1. 获取基本对话信息并记录 query 模块耗时
+        t_query_start = time.perf_counter()
+        with trace_collector.track_io(task_id, "query", "MongoDB 会话读写 IO", io_type="db"):
+            context, original_query, message_id, session_id = self.get_history_context(state)
+        history_turns = len([ln for ln in (context or "").splitlines() if ln.strip()])
+
         # 2. 进行意图识别,重写问题
-        rewritten_query, item_names = self.get_rewritten_and_item_names(context, original_query)
-        # 3. 进行向量匹配,对齐主体信息,并生成助手回复
+        self._current_key_words: list[str] = []
+        with trace_collector.track_io(task_id, "query", "LLM 意图改写与关键词提取 IO", io_type="llm"):
+            rewritten_query, item_names = self.get_rewritten_and_item_names(context, original_query)
+        extracted_item_names = list(item_names or [])
+        key_words = self._current_key_words or _extract_fallback_keywords(rewritten_query, extracted_item_names)
+        trace_collector.set_module_total_ms(task_id, "query", (time.perf_counter() - t_query_start) * 1000)
+
+        # 3. 进行向量匹配,对齐主体信息,并生成助手回复 (记录 router 模块耗时)
+        t_router_start = time.perf_counter()
+        self._current_task_id = task_id
+        self._last_matched_results: list[dict] = []
         rewritten_query, answer, final_item_lst, message_id, is_low_confidence = self.get_hierarchical_align_item_name(
             session_id, message_id, rewritten_query, original_query, item_names
+        )
+        trace_collector.set_module_total_ms(task_id, "router", (time.perf_counter() - t_router_start) * 1000)
+
+        # 4. 汇总写入观测层收集器
+        trace_collector.record_query_and_router(
+            task_id=task_id,
+            original_query=original_query,
+            rewritten_query=rewritten_query,
+            key_words=key_words,
+            extracted_item_names=extracted_item_names,
+            aligned_item_names=final_item_lst,
+            matched_results=self._last_matched_results,
+            answer=answer,
+            is_low_confidence=is_low_confidence,
+            history_turns=history_turns,
         )
 
         return {
@@ -62,6 +121,7 @@ class NodeItemNameConfirm(NodeBase):
             "original_query": original_query,
             "rewritten_query": rewritten_query,
             "item_names": final_item_lst,
+            "key_words": key_words,
             "answer": answer,
             "is_low_confidence": is_low_confidence,
         }
@@ -169,6 +229,7 @@ class NodeItemNameConfirm(NodeBase):
             parsed_response = response
 
         # 解析返回结果，拦截大模型返回 None 的特殊边界情况并进行多类型（dict 与 Pydantic）兼容解析
+        key_words = []
         if parsed_response is None:
             logger.warning("大模型返回的解析结果为空 (None)")
             rewritten_query = original_query
@@ -176,19 +237,26 @@ class NodeItemNameConfirm(NodeBase):
         elif isinstance(parsed_response, dict):
             rewritten_query = parsed_response.get("rewritten_query", "")
             item_names = parsed_response.get("item_names", [])
-            logger.info(f"意图识别成功(Dict),改写后: {rewritten_query},提取主体: {item_names}")
+            key_words = parsed_response.get("key_words", [])
+            logger.info(f"意图识别成功(Dict),改写后: {rewritten_query},提取主体: {item_names},关键词: {key_words}")
         elif isinstance(parsed_response, ItemNameExtractResult):
             rewritten_query = parsed_response.rewritten_query
             item_names = parsed_response.item_names
-            logger.info(f"意图识别成功(Pydantic),改写后: {rewritten_query},提取主体: {item_names}")
+            key_words = parsed_response.key_words
+            logger.info(f"意图识别成功(Pydantic),改写后: {rewritten_query},提取主体: {item_names},关键词: {key_words}")
         else:
             logger.warning(f"大模型返回了非预期的对象类型: {type(parsed_response)}")
             rewritten_query = getattr(parsed_response, "rewritten_query", original_query)
             item_names = getattr(parsed_response, "item_names", [])
+            key_words = getattr(parsed_response, "key_words", [])
 
         # 强力清洗逻辑：过滤大模型可能幻觉返回的空字符串或纯空格项
         if isinstance(item_names, list):
             item_names = [name.strip() for name in item_names if name and isinstance(name, str) and name.strip()]
+        if isinstance(key_words, list):
+            key_words = [kw.strip() for kw in key_words if kw and isinstance(kw, str) and kw.strip()]
+        else:
+            key_words = []
 
         # 强力防御逻辑：如果模型强行填充了 None、空字符串等，在此做归一化
         if not rewritten_query:
@@ -197,6 +265,8 @@ class NodeItemNameConfirm(NodeBase):
             item_names = [rewritten_query]
         elif isinstance(item_names, str):
             item_names = [item_names]
+
+        self._current_key_words = key_words or _extract_fallback_keywords(rewritten_query, item_names)
 
         return rewritten_query, item_names
 
@@ -215,6 +285,7 @@ class NodeItemNameConfirm(NodeBase):
         """
         final_item_lst = []
         answer = ""
+        task_id = getattr(self, "_current_task_id", "")
 
         # - 防御没有提取到意图重写内容
         if not rewritten_query:
@@ -229,12 +300,14 @@ class NodeItemNameConfirm(NodeBase):
         else:
             # 1. 向量数据库混合检索物料
             matched_results = self.search_item_names_in_milvus(item_names)
+            self._last_matched_results = matched_results
             # 2. 对分值进行层级化评估对齐
             final_item_lst, answer, is_low_confidence = self.align_item_names_by_score(matched_results)
             # 3. 完成 MongoDB 会话状态回写
-            message_id = self.handle_session_history_update(
-                session_id, message_id, rewritten_query, final_item_lst, answer
-            )
+            with trace_collector.track_io(task_id, "router", "MongoDB 主体状态回写 IO", io_type="db"):
+                message_id = self.handle_session_history_update(
+                    session_id, message_id, rewritten_query, final_item_lst, answer
+                )
 
         return rewritten_query, answer, final_item_lst, message_id, is_low_confidence
 
@@ -247,32 +320,35 @@ class NodeItemNameConfirm(NodeBase):
         Returns:
             list[dict]: 混合检索候选物料列表
         """
+        task_id = getattr(self, "_current_task_id", "")
         # 去除空白字符
         cleaned_item_names = [item.replace(" ", "").replace("\n", "").replace("\t", "") for item in item_names]
 
         # 获取稀疏/稠密双路向量
-        vecs = get_bgem3_embedding(cleaned_item_names)
+        with trace_collector.track_io(task_id, "router", "BGE-M3 主体向量化 HTTP IO", io_type="network"):
+            vecs = get_bgem3_embedding(cleaned_item_names)
         matched_results = []
 
-        for idx, item_name in enumerate(cleaned_item_names):
-            reqs = create_reqs(
-                dense_data=vecs["dense"][idx],
-                sparse_data=vecs["sparse"][idx],
-                dense_ann_field="dense",
-                sparse_ann_field="sparse",
-                limit=10,
-            )
-            result = weighted_hybrid_search(
-                collection_name=MilvusConfig.item_name_collection,
-                reqs=reqs,
-                ranker=[0.8, 0.2],
-                limit=10,
-                output_fields=["item_name"],
-            )
-            # ==========测试检索结果是否含有 '空字符串' ========
-            if result:
-                logger.debug(f"==={result[0]=}===")
-                matched_results.extend(result[0])
+        with trace_collector.track_io(task_id, "router", "Milvus 主体库混合检索 IO", io_type="db"):
+            for idx, item_name in enumerate(cleaned_item_names):
+                reqs = create_reqs(
+                    dense_data=vecs["dense"][idx],
+                    sparse_data=vecs["sparse"][idx],
+                    dense_ann_field="dense",
+                    sparse_ann_field="sparse",
+                    limit=10,
+                )
+                result = weighted_hybrid_search(
+                    collection_name=MilvusConfig.item_name_collection,
+                    reqs=reqs,
+                    ranker=[0.8, 0.2],
+                    limit=10,
+                    output_fields=["item_name"],
+                )
+                # ==========测试检索结果是否含有 '空字符串' ========
+                if result:
+                    logger.debug(f"==={result[0]=}===")
+                    matched_results.extend(result[0])
 
         return matched_results
 

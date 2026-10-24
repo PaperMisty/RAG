@@ -13,6 +13,9 @@ from atguigu.query_process.nodes.node_web_search_mcp import NodeWebSearchMcp
 from atguigu.query_process.state import QueryGraphState
 from atguigu.tool.json_format_tool import json_format
 from atguigu.tool.logger import logger
+from observer.collector import trace_collector
+import time
+import uuid
 
 
 class QueryMainGraphRunner:
@@ -67,8 +70,32 @@ class QueryMainGraphRunner:
     def run(self, state):
         if self.graph is None:
             self.graph = self.builder.compile()
-        result = self.graph.invoke(state)
-        return result
+        if not state.get("task_id"):
+            state["task_id"] = str(uuid.uuid4())
+        task_id = state["task_id"]
+        if trace_collector.get_trace(task_id) is None:
+            trace_collector.start_trace(
+                task_id=task_id,
+                original_query=state.get("original_query", ""),
+                session_id=state.get("session_id", ""),
+            )
+        t0 = time.perf_counter()
+        try:
+            result = self.graph.invoke(state)
+            trace_collector.finish_trace(
+                task_id=task_id,
+                status="completed",
+                total_duration_ms=(time.perf_counter() - t0) * 1000,
+            )
+            return result
+        except Exception as exc:
+            trace_collector.finish_trace(
+                task_id=task_id,
+                status="failed",
+                error_message=str(exc)[:300],
+                total_duration_ms=(time.perf_counter() - t0) * 1000,
+            )
+            raise
 
     @classmethod
     def create_and_run(cls, state):

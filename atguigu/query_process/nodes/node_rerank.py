@@ -1,11 +1,13 @@
 # atguigu/query_process/nodes/node_rerank.py
 
 # 【Colab远程部署改造】原百炼 DashScope 版 reranker_tool 改为自托管远程版（函数签名与返回结构不变）
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from atguigu.tool.reranker_tool import text_rerank  # 回滚百炼 DashScope 版(改造时保留未删);自托管远程版见 reranker_http_tool,待统一分发后再切换
-from atguigu.tool.json_format_tool import json_format
 from atguigu.query_process.base import NodeBase
 from atguigu.query_process.state import QueryGraphState
-from atguigu.tool.logger import logger
+from atguigu.tool.logger import logger, summarize_docs
+from observer.collector import trace_collector
+import time
 
 
 class NodeRerank(NodeBase):
@@ -22,10 +24,32 @@ class NodeRerank(NodeBase):
         :param state: 工作流状态对象
         :return: 更新后的状态对象
         """
-        # 重排序
+        task_id = state.get("task_id") or ""
+        # 1. 重排序 (记录 Reranker HTTP IO 耗时)
+        t_rerank = time.perf_counter()
         rerank_merge_docs = self.get_rerank_docs(state)
-        # 断崖检测
+        rerank_ms = round((time.perf_counter() - t_rerank) * 1000, 2)
+
+        # 2. 断崖检测 (记录 Cliff CPU 耗时)
+        t_cliff = time.perf_counter()
         reranked_docs = self.cliff_detection(rerank_merge_docs)
+        cliff_ms = round((time.perf_counter() - t_cliff) * 1000, 2)
+
+        if task_id:
+            trace_collector.add_io_item(task_id, "reranker", "Cross-Encoder Rerank HTTP IO", rerank_ms, io_type="network")
+            trace_collector.set_module_total_ms(task_id, "reranker", rerank_ms)
+            trace_collector.add_io_item(task_id, "cliff", "断崖分差截断 CPU 计算", cliff_ms, io_type="cpu")
+            trace_collector.set_module_total_ms(task_id, "cliff", cliff_ms)
+            trace_collector.record_rerank_and_cliff(
+                task_id=task_id,
+                rerank_all_docs=rerank_merge_docs,
+                cliff_kept_docs=reranked_docs,
+                abs_gap_thres=0.25,
+                ratio_gap_thres=0.10,
+                min_len=3,
+                max_len=10,
+            )
+
         return {"reranked_docs": reranked_docs}
 
     def cliff_detection(self, rerank_merge_docs: list[dict]) -> list[dict]:
@@ -80,6 +104,9 @@ class NodeRerank(NodeBase):
             content_val = doc.get("chunk_content") or doc.get("content")
             if content_val and isinstance(content_val, str):
                 cleaned_docs.append({
+                    "id": doc.get("id"),
+                    "item_name": doc.get("item_name"),
+                    "rrf_rank": doc.get("rrf_rank"),
                     "title": doc.get("item_name") or doc.get("title") or "未知标题",
                     "content": content_val,
                     "source": doc.get("source"),
@@ -89,16 +116,29 @@ class NodeRerank(NodeBase):
                 })
         merge_docs = cleaned_docs
         documents = [doc.get("content") for doc in merge_docs]
-        # 获取Web和Local重排序的排名
-        rerank_lst = text_rerank(query=rewritten_query, documents=documents, top_n=len(merge_docs))
+        # 获取Web和Local重排序的排名。dashscope 调用本身没有 timeout
+        # 参数（实测一次跑了 45 秒），直接调会在上游卡住时让整图无限
+        # 挂起。120 秒是底线而非目标：正常重排远低于此，超时后图走
+        # 统一的 error 事件链路，前端不再静默转圈。注意：超时后 worker
+        # 线程仍在后台跑完（无法安全杀掉），只是图不再等它。
+        rerank_executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            rerank_future = rerank_executor.submit(
+                text_rerank, query=rewritten_query, documents=documents, top_n=len(merge_docs)
+            )
+            rerank_lst = rerank_future.result(timeout=120)
+        except FutureTimeoutError:
+            rerank_executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError("重排序调用超时（120 秒），请重试")
+        finally:
+            rerank_executor.shutdown(wait=False, cancel_futures=True)
         # 赋值分数
         for item in rerank_lst:
             merge_docs[item["index"]]["score"] = item["score"]
         # 按分数排名
         rerank_merge_docs = sorted(merge_docs, key=lambda x: x["score"], reverse=True)
         # =========== 展示示例 ==========
-        logger.info(f"Reranker重排结果: {len(rerank_merge_docs)}")
-        logger.info(json_format(rerank_merge_docs[:2]))
+        logger.info(f"Reranker重排结果: {summarize_docs(rerank_merge_docs, limit=3)}")
         return rerank_merge_docs
 
 
