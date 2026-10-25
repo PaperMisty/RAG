@@ -108,12 +108,12 @@ class NodeAnswerOutput(NodeBase):
                     context_chunk_count=0,
                     ttft_ms=out_ms,
                 )
-        # 置信度极低或主体未识别，网络搜索总结情况
+        # 置信度极低或主体未识别，网络搜索总结情况 (优先读取重排过滤后的网络文档)
         elif is_low_confidence:
-            web_search_docs = state.get("web_search_docs", [])
-            if not web_search_docs:
-                # Tavily 失败/空结果且低置信：不进 LLM，直接回固定句，避免模型编造“网络搜索结果”。
-                answer = "[\u672a\u68c0\u7d22\u5230\u76f8\u5173\u4e3b\u4f53]"
+            candidate_web_docs = state.get("reranked_docs") or state.get("web_search_docs") or []
+            if not candidate_web_docs:
+                # 网络搜索失败/空结果且低置信：不进 LLM，直接回固定句，避免模型编造“网络搜索结果”。
+                answer = "[未检索到相关主体]"
                 if q is not None:
                     q.put({"event": "chunks", "data": []})
                     q.put({"event": "delta", "data": {"delta": answer}})
@@ -138,9 +138,11 @@ class NodeAnswerOutput(NodeBase):
                 logger.info(f"低置信度且网络搜索无结果，直接返回固定句，未调用 LLM, id:{insert_id}")
                 return {"answer": answer}
             combine_content = ""
-            for idx, doc in enumerate(web_search_docs, 1):
-                content = f'[{idx}][来源: {doc.get("title")}][网址: {doc.get("url")}]\n内容摘要: {doc.get("content")}\n\n'
-                combine_content += content
+            for idx, doc in enumerate(candidate_web_docs, 1):
+                title = doc.get("title") or "网络搜索结果"
+                url = doc.get("url") or ""
+                content_val = doc.get("content") or doc.get("chunk_content") or ""
+                combine_content += f'[{idx}][来源: {title}][网址: {url}]\n内容摘要: {content_val}\n\n'
                 
             # 拼接历史对话记录
             t_hist = time.perf_counter()
@@ -170,9 +172,9 @@ class NodeAnswerOutput(NodeBase):
                     "id": str(idx),
                     "file_title": doc.get("title", "网络搜索结果"),
                     "section_title": doc.get("url", ""),
-                    "content": doc.get("content", "")
+                    "content": doc.get("content") or doc.get("chunk_content", "")
                 }
-                for idx, doc in enumerate(web_search_docs, 1)
+                for idx, doc in enumerate(candidate_web_docs, 1)
             ]
             if q is not None:
                 q.put({"event": "chunks", "data": web_chunks})
@@ -209,18 +211,22 @@ class NodeAnswerOutput(NodeBase):
                     final_answer=answer,
                     output_mode="low_conf_web_llm",
                     model_name=str(TextLLMConfig.default_model or "LLM"),
-                    context_chunk_count=len(web_search_docs),
+                    context_chunk_count=len(candidate_web_docs),
                     ttft_ms=ttft_ms,
                 )
             logger.info(f"低置信度网络搜索总结信息已插入数据库, id:{insert_id}")
-        # 置信度较高情况, 触发常规本地RAG回答
+        # 置信度较高情况, 触发常规本地RAG回答 (优先取重排文档，若跳过重排则取RRF文档)
         else:
-            chunk_dict_list = state.get("reranked_docs") or []
-            # 拼接chunk_dict内容
+            chunk_dict_list = state.get("reranked_docs") or state.get("rrf_chunks") or []
+            # 拼接chunk_dict内容（携带文档标题与章节标题，确保纯表格切片具备完整上下文语义）
             combine_content = ""
             for idx, chunk_dict in enumerate(chunk_dict_list, 1):
-                content = f'[{idx}][{chunk_dict["source"]}][{chunk_dict["title"]}]\n[{chunk_dict["content"]}]\n\n'
-                combine_content += content
+                source = chunk_dict.get("source", "local")
+                file_title = chunk_dict.get("file_title") or chunk_dict.get("title") or "本地知识库"
+                section_title = chunk_dict.get("section_title") or ""
+                header_str = f"{file_title} | {section_title}" if section_title and section_title != file_title else file_title
+                content_val = chunk_dict.get("content") or chunk_dict.get("chunk_content") or ""
+                combine_content += f"[{idx}][{source}][{header_str}]\n[{content_val}]\n\n"
             # ===================
             # 测试,查看chunk_content是否存在链接
             import re
@@ -262,7 +268,7 @@ class NodeAnswerOutput(NodeBase):
                     "id": str(idx),
                     "file_title": chunk.get("file_title") or chunk.get("source") or "未知文档",
                     "section_title": chunk.get("section_title") or chunk.get("title") or "正文",
-                    "content": chunk.get("content", "")
+                    "content": chunk.get("content") or chunk.get("chunk_content") or ""
                 }
                 for idx, chunk in enumerate(chunk_dict_list, 1)
             ]

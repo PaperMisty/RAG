@@ -43,7 +43,7 @@ class TraceCollector:
                 label="高置信度路由 (score ≥ 0.8)",
                 condition="confidence ≥ 0.8 或唯一中置信候选",
                 is_active=False,
-                target_desc="Dense + Sparse + HyDE + Web 多路检索 → RRF → Reranker → 断崖检测 → LLM",
+                target_desc="Re-Query + HyDE 向量化混合检索 (Dense + Sparse) → RRF → Reranker → 断崖检测 → LLM",
             ),
             RouteBranchStatus(
                 route_key="medium_clarify",

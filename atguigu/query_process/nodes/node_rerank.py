@@ -115,7 +115,10 @@ class NodeRerank(NodeBase):
                     "section_title": doc.get("section_title"),
                 })
         merge_docs = cleaned_docs
-        documents = [doc.get("content") for doc in merge_docs]
+        documents = [
+            f"{doc.get('file_title') or ''} {doc.get('section_title') or ''}\n{doc.get('content') or ''}".strip()
+            for doc in merge_docs
+        ]
         # 获取Web和Local重排序的排名。dashscope 调用本身没有 timeout
         # 参数（实测一次跑了 45 秒），直接调会在上游卡住时让整图无限
         # 挂起。120 秒是底线而非目标：正常重排远低于此，超时后图走

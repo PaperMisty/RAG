@@ -1295,7 +1295,7 @@ function renderTraceCanvas(trace) {
     // 1. 关键词与主体胶囊
     const kwPills = (qMod.key_words || []).length > 0
         ? qMod.key_words.map(k => `<span class="obs-tag-pill kw-pill">🔑 ${escapeHtml(k)}</span>`).join('')
-        : `<span class="obs-tag-pill raw-item-pill">无提取关键词</span>`;
+        : `<span class="obs-tag-pill raw-item-pill">已停用关键词提取 (采用 Re-Query + HyDE 向量混合检索)</span>`;
 
     const alignedItems = (qMod.aligned_item_names || []).length > 0
         ? qMod.aligned_item_names.map(n => `<span class="obs-tag-pill item-pill">✅ ${escapeHtml(n)}</span>`).join('')

@@ -12,6 +12,7 @@ from atguigu.tool.logger import logger, summarize_docs
 from observer.collector import trace_collector
 import json
 import time
+from typing import Any
 from rich import print
 
 
@@ -23,13 +24,8 @@ class NodeSearchEmbedding(NodeBase):
     # 覆盖基类的 name 属性，标识节点名称
     name: str = "node_search_embedding"
 
-    def process(self, state: QueryGraphState):
-        """
-        节点逻辑
-        :param state: 工作流状态对象
-        :return: 更新后的状态对象
-        """
-
+    def process(self, state: QueryGraphState) -> dict:
+        """职责: 执行 Re-Query 向量化与混合检索并上报观测层指标"""
         logger.info(f"【{self.name}】节点逻辑")
         task_id = state.get("task_id") or ""
         item_names = state.get("item_names")
@@ -37,6 +33,8 @@ class NodeSearchEmbedding(NodeBase):
         if not item_names or not rewritten_query:
             logger.error(f"缺少主体名称或改写后的问题{item_names=},{rewritten_query=}")
             raise ValueError(f"缺少主体名称或改写后的问题{item_names=},{rewritten_query=}")
+
+        # 执行 Re-Query 向量化检索（同时记录 Dense、Sparse 及混合检索详情至观测层）
         embedding_chunks, dense_chunks, sparse_chunks = self.search_chunks_with_details(
             rewritten_query, item_names, source="local", limit=10, task_id=task_id
         )
@@ -46,12 +44,56 @@ class NodeSearchEmbedding(NodeBase):
             "sparse_chunks": sparse_chunks,
         }
 
+    @staticmethod
+    def _fuse_dense_and_sparse(
+        dense_chunks: list[dict], sparse_chunks: list[dict], limit: int = 10, dense_weight: float = 0.55, sparse_weight: float = 0.45
+    ) -> list[dict]:
+        """职责: 对Dense(Cosine)与Sparse(IP)检索结果做Min-Max分数归一化加权融合，解决Milvus跨度量尺度未归一化导致Sparse失效的问题"""
+        def _norm_scores(chunks: list[dict]) -> dict[Any, float]:
+            if not chunks:
+                return {}
+            scores = [float(c.get("score", 0.0) or 0.0) for c in chunks]
+            s_max, s_min = max(scores), min(scores)
+            span = s_max - s_min
+            res_map = {}
+            for idx, c in enumerate(chunks):
+                cid = c.get("id")
+                raw_s = float(c.get("score", 0.0) or 0.0)
+                # 若分差极小则按排名衰减赋予 [0.5, 1.0] 归一化分，否则按 Min-Max 映射到 [0.3, 1.0]
+                norm_s = (0.3 + 0.7 * (raw_s - s_min) / span) if span > 1e-6 else (1.0 - idx * 0.05)
+                res_map[cid] = max(0.1, norm_s)
+            return res_map
+
+        dense_norm = _norm_scores(dense_chunks)
+        sparse_norm = _norm_scores(sparse_chunks)
+
+        merged: dict[Any, dict] = {}
+        for rank_d, ch in enumerate(dense_chunks, 1):
+            cid = ch.get("id")
+            item = ch.copy()
+            item["dense_rank"] = rank_d
+            item["score"] = round(dense_weight * dense_norm.get(cid, 0.0), 4)
+            merged[cid] = item
+
+        for rank_s, ch in enumerate(sparse_chunks, 1):
+            cid = ch.get("id")
+            s_part = sparse_weight * sparse_norm.get(cid, 0.0)
+            if cid in merged:
+                merged[cid]["sparse_rank"] = rank_s
+                merged[cid]["score"] = round(merged[cid]["score"] + s_part, 4)
+            else:
+                item = ch.copy()
+                item["sparse_rank"] = rank_s
+                item["score"] = round(s_part, 4)
+                merged[cid] = item
+
+        fused = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+        return fused[:limit]
+
     def search_chunks_with_details(
         self, query: str, item_names: list[str], source: str, limit: int = 10, task_id: str = ""
     ) -> tuple[list[dict], list[dict], list[dict]]:
         """职责: 执行向量化并分别获取Dense排名、Sparse排名与混合检索排名及网络IO耗时"""
-        t_start = time.perf_counter()
-
         # 1. 将重写问题转换成 embedding 向量 (记录 BGE-M3 HTTP IO)
         t_emb = time.perf_counter()
         vecs = get_bgem3_embedding([query])
@@ -72,27 +114,10 @@ class NodeSearchEmbedding(NodeBase):
             source=source,
         )
 
-        # 3. 执行原有加权混合检索
-        reqs = create_reqs(
-            dense_data=vecs["dense"][0],
-            sparse_data=vecs["sparse"][0],
-            dense_ann_field="dense",
-            sparse_ann_field="sparse",
-            expr=expr,
-        )
+        # 3. 执行跨度量 Min-Max 归一化混合融合，确保稠密语义与稀疏关键词同时生效
         t_hyb = time.perf_counter()
-        res = weighted_hybrid_search(
-            collection_name=collection_name,
-            reqs=reqs,
-            ranker=[0.8, 0.2],
-            limit=limit,
-            output_fields=output_fields,
-        )
+        embedding_chunks = self._fuse_dense_and_sparse(dense_chunks, sparse_chunks, limit=limit)
         hyb_io_ms = round((time.perf_counter() - t_hyb) * 1000, 2)
-
-        embedding_chunks = []
-        for search_result in res[0]:
-            embedding_chunks.append({**search_result["entity"], "score": search_result["distance"], "source": source})
 
         # 4. 写入观测层收集器
         if task_id:
@@ -107,7 +132,7 @@ class NodeSearchEmbedding(NodeBase):
             trace_collector.add_io_item(task_id, "retrieval", "BGE-M3 Query 向量化 IO", emb_io_ms, io_type="network")
             trace_collector.add_io_item(task_id, "retrieval", "Milvus Dense 检索 IO", dense_io_ms, io_type="db")
             trace_collector.add_io_item(task_id, "retrieval", "Milvus Sparse 检索 IO", sparse_io_ms, io_type="db")
-            trace_collector.add_io_item(task_id, "retrieval", "Milvus Hybrid 检索 IO", hyb_io_ms, io_type="db")
+            trace_collector.add_io_item(task_id, "retrieval", "Hybrid 归一化融合计算", hyb_io_ms, io_type="cpu")
             trace_collector.record_dense_sparse_retrieval(
                 task_id=task_id,
                 dense_chunks=dense_chunks,
@@ -118,35 +143,24 @@ class NodeSearchEmbedding(NodeBase):
         logger.info(f"Re-Query向量检索结果: {summarize_docs(embedding_chunks, limit=3)}")
         return embedding_chunks, dense_chunks, sparse_chunks
 
-    def search_chunks(self, query, item_names, source, limit=10):
-        # 将重写问题转换成embedding向量
+    def search_chunks(self, query: str, item_names: list[str], source: str, limit: int = 10) -> list[dict]:
+        """职责: 对查询文本执行BGE-M3向量化与稠密+稀疏归一化混合检索"""
         vecs = get_bgem3_embedding([query])
-        # 标量搜索依然很重要, 不过expr逐渐推荐用filter代替了
-        expr = f"item_name in {json.dumps(item_names, ensure_ascii=False)}"  # json.dumps 自身已具备完美的自动转义机制
-        reqs = create_reqs(
-            dense_data=vecs["dense"][0],
-            sparse_data=vecs["sparse"][0],
-            dense_ann_field="dense",
-            sparse_ann_field="sparse",
-            expr=expr,
-        )
+        expr = f"item_name in {json.dumps(item_names, ensure_ascii=False)}"
         collection_name = MilvusConfig.chunks_collection
-        res = weighted_hybrid_search(
+        output_fields = ["id", "file_title", "section_title", "chunk_content", "item_name"]
+
+        dense_chunks, sparse_chunks, _, _ = search_dense_and_sparse_separately(
             collection_name=collection_name,
-            reqs=reqs,
-            ranker=[0.8, 0.2],
+            dense_vec=vecs["dense"][0],
+            sparse_vec=vecs["sparse"][0],
+            expr=expr,
             limit=limit,
-            output_fields=["id", "file_title", "section_title", "chunk_content", "item_name"],
+            output_fields=output_fields,
+            source=source,
         )
-        # print(json_format(res))
-
-        # 组装检索出的chunk信息
-        embedding_chunks = []
-        for search_result in res[0]:
-            embedding_chunks.append({**search_result["entity"], "score": search_result["distance"], "source": source})
-
-        # =========== 展示示例 ==========
-        logger.info(f"Re-Query向量检索结果: {summarize_docs(embedding_chunks, limit=3)}")
+        embedding_chunks = self._fuse_dense_and_sparse(dense_chunks, sparse_chunks, limit=limit)
+        logger.info(f"向量混合检索结果: {summarize_docs(embedding_chunks, limit=3)}")
         return embedding_chunks
 
 

@@ -37,11 +37,12 @@ class NodeRrf(NodeBase):
         RRF_SMOOTH = 60
         RRF_TOP_K = 10
         rrf_dict = {}  # 用 dict 代替列表，实现 O(1) 复杂度的去重与定位
+        # 对 Re-Query 混合检索与 HyDE 混合检索进行 1:1 倒排融合，同时将未进混合前10的 Dense/Sparse 尾部候补纳入展示
         rrf_weight = [(embedding_chunks, 1.0), (hyde_embedding_chunks, 1.0)]
         if dense_chunks:
-            rrf_weight.append((dense_chunks, 0.8))
+            rrf_weight.append((dense_chunks, 0.3))
         if sparse_chunks:
-            rrf_weight.append((sparse_chunks, 0.2))
+            rrf_weight.append((sparse_chunks, 0.3))
 
         for embedding, weight in rrf_weight:
             for rank, chunk in enumerate(embedding, 1):
