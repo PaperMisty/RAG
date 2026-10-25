@@ -94,5 +94,57 @@ def weighted_hybrid_search(
     return result
 
 
+def search_dense_and_sparse_separately(
+    collection_name: str,
+    dense_vec: list[float],
+    sparse_vec: dict[int, float],
+    expr: str = "",
+    limit: int = 10,
+    output_fields: list[str] | None = None,
+    source: str = "local",
+) -> tuple[list[dict], list[dict], float, float]:
+    """职责: 复用Milvus连接池分别执行Dense稠密检索与Sparse稀疏检索并返回各自排名切片与IO耗时(ms)"""
+    import time
+
+    milvus_cli = get_milvus_client()
+    milvus_cli.load_collection(collection_name)
+
+    # 1. 执行 Dense 单路余弦相似度检索并记录网络IO耗时
+    t_dense = time.perf_counter()
+    dense_res = milvus_cli.search(
+        collection_name=collection_name,
+        data=[dense_vec],
+        anns_field="dense",
+        filter=expr or "",
+        limit=limit,
+        output_fields=output_fields,
+        search_params={"metric_type": "COSINE"},
+    )
+    dense_io_ms = round((time.perf_counter() - t_dense) * 1000, 2)
+    dense_chunks: list[dict] = []
+    if dense_res and len(dense_res) > 0:
+        for hit in dense_res[0]:
+            dense_chunks.append({**hit.get("entity", {}), "score": hit.get("distance", 0.0), "source": source})
+
+    # 2. 执行 Sparse 单路内积检索并记录网络IO耗时
+    t_sparse = time.perf_counter()
+    sparse_res = milvus_cli.search(
+        collection_name=collection_name,
+        data=[sparse_vec],
+        anns_field="sparse",
+        filter=expr or "",
+        limit=limit,
+        output_fields=output_fields,
+        search_params={"metric_type": "IP"},
+    )
+    sparse_io_ms = round((time.perf_counter() - t_sparse) * 1000, 2)
+    sparse_chunks: list[dict] = []
+    if sparse_res and len(sparse_res) > 0:
+        for hit in sparse_res[0]:
+            sparse_chunks.append({**hit.get("entity", {}), "score": hit.get("distance", 0.0), "source": source})
+
+    return dense_chunks, sparse_chunks, dense_io_ms, sparse_io_ms
+
+
 if __name__ == "__main__":
     get_milvus_client()

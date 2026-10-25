@@ -19,6 +19,8 @@ class QueryGraphState(TypedDict):
 
     # 检索过程中的中间数据
     embedding_chunks: list  # 普通向量检索回来的切片
+    dense_chunks: list  # Dense 稠密向量检索回来的切片
+    sparse_chunks: list  # Sparse 稀疏向量检索回来的切片
     hyde_embedding_chunks: list  # 已向量化的假设性问题切片
     web_search_docs: list  # 网络搜索回来的文档
 
@@ -32,6 +34,7 @@ class QueryGraphState(TypedDict):
 
     # 辅助信息
     item_names: List[str]  # 提取出的商品名称
+    key_words: List[str]  # 提取出的查询核心关键词
     rewritten_query: str  # 改写后的问题
     history: list  # 历史对话记录
     is_low_confidence: bool  # 是否低置信度（无主体识别）

@@ -6,8 +6,9 @@ from atguigu.config.config import MilvusConfig
 from atguigu.tool.json_format_tool import json_format
 from atguigu.tool.milvus_client_tool import weighted_hybrid_search
 from atguigu.tool.milvus_client_tool import create_reqs
-from atguigu.tool.bgem3_client_tool import get_bgem3_embedding
-from atguigu.config.config import LLMConfig, PromptConfig
+# 【Colab远程部署改造】原本地模型版 bgem3_client_tool 改为远程 HTTP 版（函数签名与返回结构不变）
+from atguigu.tool.bgem3_tool import get_bgem3_embedding  # 改走统一分发(EMBED_SOURCE),与检索/入库一致;原写死远程 HTTP 版
+from atguigu.config.config import LLMConfig, PromptConfig, TextLLMConfig  # 【Colab远程部署改造】文本模型走网关配置
 from langchain.chat_models import init_chat_model
 from atguigu.tool.mongo_client_tool import get_recent_history_list
 from atguigu.tool.mongo_client_tool import add_or_update_data
@@ -16,7 +17,9 @@ from rich import print
 from atguigu.query_process.base import NodeBase
 from atguigu.query_process.state import QueryGraphState
 from atguigu.tool.logger import logger
+from observer.collector import trace_collector
 from pydantic import BaseModel, Field
+import re
 
 
 class ItemNameExtractResult(BaseModel):
@@ -47,13 +50,48 @@ class NodeItemNameConfirm(NodeBase):
         """
 
         logger.info(f"【{self.name}】节点逻辑")
-        # 1. 获取基本对话信息
-        context, original_query, message_id, session_id = self.get_history_context(state)
+        task_id = state.get("task_id") or ""
+        if task_id and trace_collector.get_trace(task_id) is None:
+            trace_collector.start_trace(
+                task_id=task_id,
+                original_query=state.get("original_query", ""),
+                session_id=state.get("session_id", ""),
+            )
+
+        # 1. 获取基本对话信息并记录 query 模块耗时
+        t_query_start = time.perf_counter()
+        with trace_collector.track_io(task_id, "query", "MongoDB 会话读写 IO", io_type="db"):
+            context, original_query, message_id, session_id = self.get_history_context(state)
+        history_turns = len([ln for ln in (context or "").splitlines() if ln.strip()])
+
         # 2. 进行意图识别,重写问题
-        rewritten_query, item_names = self.get_rewritten_and_item_names(context, original_query)
-        # 3. 进行向量匹配,对齐主体信息,并生成助手回复
+        with trace_collector.track_io(task_id, "query", "LLM 意图改写与主体抽取 IO", io_type="llm"):
+            rewritten_query, item_names = self.get_rewritten_and_item_names(context, original_query)
+        extracted_item_names = list(item_names or [])
+        key_words: list[str] = []
+        trace_collector.set_module_total_ms(task_id, "query", (time.perf_counter() - t_query_start) * 1000)
+
+        # 3. 进行向量匹配,对齐主体信息,并生成助手回复 (记录 router 模块耗时)
+        t_router_start = time.perf_counter()
+        self._current_task_id = task_id
+        self._last_matched_results: list[dict] = []
         rewritten_query, answer, final_item_lst, message_id, is_low_confidence = self.get_hierarchical_align_item_name(
             session_id, message_id, rewritten_query, original_query, item_names
+        )
+        trace_collector.set_module_total_ms(task_id, "router", (time.perf_counter() - t_router_start) * 1000)
+
+        # 4. 汇总写入观测层收集器
+        trace_collector.record_query_and_router(
+            task_id=task_id,
+            original_query=original_query,
+            rewritten_query=rewritten_query,
+            key_words=key_words,
+            extracted_item_names=extracted_item_names,
+            aligned_item_names=final_item_lst,
+            matched_results=self._last_matched_results,
+            answer=answer,
+            is_low_confidence=is_low_confidence,
+            history_turns=history_turns,
         )
 
         return {
@@ -61,6 +99,7 @@ class NodeItemNameConfirm(NodeBase):
             "original_query": original_query,
             "rewritten_query": rewritten_query,
             "item_names": final_item_lst,
+            "key_words": key_words,
             "answer": answer,
             "is_low_confidence": is_low_confidence,
         }
@@ -124,10 +163,11 @@ class NodeItemNameConfirm(NodeBase):
             tuple: (rewritten_query, item_names)
         """
         llm = init_chat_model(
-            model=LLMConfig.item_model,
-            model_provider=LLMConfig.model_provider,
-            base_url=LLMConfig.base_url,
-            api_key=LLMConfig.api_key,
+            model=TextLLMConfig.default_model,
+            model_provider=TextLLMConfig.model_provider,
+            base_url=TextLLMConfig.base_url,
+            api_key=TextLLMConfig.api_key,
+            extra_body=TextLLMConfig.extra_body,
             temperature=LLMConfig.temperature,
         )
 
@@ -166,7 +206,7 @@ class NodeItemNameConfirm(NodeBase):
         else:
             parsed_response = response
 
-        # 解析返回结果，拦截大模型返回 None 的特殊边界情况并进行多类型（dict 与 Pydantic）兼容解析
+        # 解析返回结果，拦截大模型返回 None 的特殊边界情况并进行多类型兼容解析
         if parsed_response is None:
             logger.warning("大模型返回的解析结果为空 (None)")
             rewritten_query = original_query
@@ -213,6 +253,7 @@ class NodeItemNameConfirm(NodeBase):
         """
         final_item_lst = []
         answer = ""
+        task_id = getattr(self, "_current_task_id", "")
 
         # - 防御没有提取到意图重写内容
         if not rewritten_query:
@@ -227,12 +268,14 @@ class NodeItemNameConfirm(NodeBase):
         else:
             # 1. 向量数据库混合检索物料
             matched_results = self.search_item_names_in_milvus(item_names)
+            self._last_matched_results = matched_results
             # 2. 对分值进行层级化评估对齐
             final_item_lst, answer, is_low_confidence = self.align_item_names_by_score(matched_results)
             # 3. 完成 MongoDB 会话状态回写
-            message_id = self.handle_session_history_update(
-                session_id, message_id, rewritten_query, final_item_lst, answer
-            )
+            with trace_collector.track_io(task_id, "router", "MongoDB 主体状态回写 IO", io_type="db"):
+                message_id = self.handle_session_history_update(
+                    session_id, message_id, rewritten_query, final_item_lst, answer
+                )
 
         return rewritten_query, answer, final_item_lst, message_id, is_low_confidence
 
@@ -245,32 +288,35 @@ class NodeItemNameConfirm(NodeBase):
         Returns:
             list[dict]: 混合检索候选物料列表
         """
+        task_id = getattr(self, "_current_task_id", "")
         # 去除空白字符
         cleaned_item_names = [item.replace(" ", "").replace("\n", "").replace("\t", "") for item in item_names]
 
         # 获取稀疏/稠密双路向量
-        vecs = get_bgem3_embedding(cleaned_item_names)
+        with trace_collector.track_io(task_id, "router", "BGE-M3 主体向量化 HTTP IO", io_type="network"):
+            vecs = get_bgem3_embedding(cleaned_item_names)
         matched_results = []
 
-        for idx, item_name in enumerate(cleaned_item_names):
-            reqs = create_reqs(
-                dense_data=vecs["dense"][idx],
-                sparse_data=vecs["sparse"][idx],
-                dense_ann_field="dense",
-                sparse_ann_field="sparse",
-                limit=10,
-            )
-            result = weighted_hybrid_search(
-                collection_name=MilvusConfig.item_name_collection,
-                reqs=reqs,
-                ranker=[0.8, 0.2],
-                limit=10,
-                output_fields=["item_name"],
-            )
-            # ==========测试检索结果是否含有 '空字符串' ========
-            if result:
-                logger.debug(f"==={result[0]=}===")
-                matched_results.extend(result[0])
+        with trace_collector.track_io(task_id, "router", "Milvus 主体库混合检索 IO", io_type="db"):
+            for idx, item_name in enumerate(cleaned_item_names):
+                reqs = create_reqs(
+                    dense_data=vecs["dense"][idx],
+                    sparse_data=vecs["sparse"][idx],
+                    dense_ann_field="dense",
+                    sparse_ann_field="sparse",
+                    limit=10,
+                )
+                result = weighted_hybrid_search(
+                    collection_name=MilvusConfig.item_name_collection,
+                    reqs=reqs,
+                    ranker=[0.8, 0.2],
+                    limit=10,
+                    output_fields=["item_name"],
+                )
+                # ==========测试检索结果是否含有 '空字符串' ========
+                if result:
+                    logger.debug(f"==={result[0]=}===")
+                    matched_results.extend(result[0])
 
         return matched_results
 

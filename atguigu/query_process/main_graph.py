@@ -13,6 +13,9 @@ from atguigu.query_process.nodes.node_web_search_mcp import NodeWebSearchMcp
 from atguigu.query_process.state import QueryGraphState
 from atguigu.tool.json_format_tool import json_format
 from atguigu.tool.logger import logger
+from observer.collector import trace_collector
+import time
+import uuid
 
 
 class QueryMainGraphRunner:
@@ -32,43 +35,76 @@ class QueryMainGraphRunner:
         self.builder.add_node(NodeAnswerOutput.name, NodeAnswerOutput())
 
     def after_item_name_confirm_router(self, state: QueryGraphState):
+        """职责: 主体确认后的条件路由分支选择"""
         answer = state.get("answer", "")
         is_low_confidence = state.get("is_low_confidence", False)
         if answer:
             # 中置信度多个选项，跳转至澄清回答
             return NodeAnswerOutput.name
         elif is_low_confidence:
-            # 低置信度，只路由去网络搜索节点
+            # 低置信度，仅路由去网络搜索节点
             logger.info("【路由】主体匹配置信度低，只进行网络搜索")
             return NodeWebSearchMcp.name
         else:
-            # 高置信度，本地向量 + 网络搜索并行检索
-            return [NodeSearchEmbeddingHyde.name, NodeSearchEmbedding.name, NodeWebSearchMcp.name]
+            # 高置信度，执行 Re-Query 与 HyDE 向量化混合检索
+            logger.info("【路由】主体匹配置信度高，路由至本地向量混合检索 (Re-Query + HyDE)")
+            return [NodeSearchEmbeddingHyde.name, NodeSearchEmbedding.name]
 
     def after_web_search_router(self, state: QueryGraphState):
+        """职责: 网络搜索完成后的条件路由分支选择"""
         is_low_confidence = state.get("is_low_confidence", False)
         if is_low_confidence:
             # 低置信度，网络搜索后直接跳转到输出生成节点
             return NodeAnswerOutput.name
         else:
-            # 正常高置信度，网络搜索后进入 RRF 排序融合
+            # 高置信度，网络搜索后进入 RRF 排序融合
             return NodeRrf.name
 
     def add_edges(self):
+        """职责: 编排节点执行边与拓扑关系"""
         self.builder.set_entry_point(NodeItemNameConfirm.name)
+        # 1. 意图与主体确认后的条件路由
         self.builder.add_conditional_edges(NodeItemNameConfirm.name, self.after_item_name_confirm_router)
+        # 2. 高置信度本地检索分支 (Re-Query + HyDE) 汇入 RRF
         self.builder.add_edge(NodeSearchEmbeddingHyde.name, NodeRrf.name)
         self.builder.add_edge(NodeSearchEmbedding.name, NodeRrf.name)
-        self.builder.add_conditional_edges(NodeWebSearchMcp.name, self.after_web_search_router)
+        # 3. RRF 倒排融合后进入 Reranker 重排与断崖检测
         self.builder.add_edge(NodeRrf.name, NodeRerank.name)
         self.builder.add_edge(NodeRerank.name, NodeAnswerOutput.name)
+        # 4. 低置信度网络搜索分支路由
+        self.builder.add_conditional_edges(NodeWebSearchMcp.name, self.after_web_search_router)
+        # 5. 回答输出结束
         self.builder.add_edge(NodeAnswerOutput.name, END)
 
     def run(self, state):
         if self.graph is None:
             self.graph = self.builder.compile()
-        result = self.graph.invoke(state)
-        return result
+        if not state.get("task_id"):
+            state["task_id"] = str(uuid.uuid4())
+        task_id = state["task_id"]
+        if trace_collector.get_trace(task_id) is None:
+            trace_collector.start_trace(
+                task_id=task_id,
+                original_query=state.get("original_query", ""),
+                session_id=state.get("session_id", ""),
+            )
+        t0 = time.perf_counter()
+        try:
+            result = self.graph.invoke(state)
+            trace_collector.finish_trace(
+                task_id=task_id,
+                status="completed",
+                total_duration_ms=(time.perf_counter() - t0) * 1000,
+            )
+            return result
+        except Exception as exc:
+            trace_collector.finish_trace(
+                task_id=task_id,
+                status="failed",
+                error_message=str(exc)[:300],
+                total_duration_ms=(time.perf_counter() - t0) * 1000,
+            )
+            raise
 
     @classmethod
     def create_and_run(cls, state):

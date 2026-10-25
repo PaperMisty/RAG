@@ -16,6 +16,8 @@ STATIC_DIR = ROOT_DIR / "web" / "page"
 class MineruConfig:
     mineru_token = os.getenv("mineru_token")
     mineru_base_url = os.getenv("mineru_base_url")
+    # 解析后端开关：mineru_cloud（默认，现有云端 API）| colab（Colab 网关 /parse）
+    parse_backend = os.getenv("PARSE_BACKEND", "mineru_cloud")
 
 
 class LLMConfig:
@@ -26,6 +28,20 @@ class LLMConfig:
     vlm_model = os.getenv("VL_MODEL")
     item_model = os.getenv("ITEM_MODEL")
     model_provider = "openai"
+
+
+class TextLLMConfig:
+    # 【Colab远程部署改造】文本大模型专用配置，与 LLMConfig 分开，原因：
+    # LLMConfig 的 base_url / api_key 还被 VL 模型（import_process/nodes/node_md_img.py）
+    # 与 Web 搜索 MCP（query_process/nodes/node_web_search_mcp.py 的 token）共用，
+    # 不能整体改指向网关；只有文本模型改走 Colab 上的 LiteLLM 网关，用这一组 TEXT_LLM_* 变量。
+    api_key = os.getenv("TEXT_LLM_OPENAI_API_KEY")
+    base_url = os.getenv("TEXT_LLM_OPENAI_API_BASE")
+    default_model = os.getenv("TEXT_LLM_DEFAULT_MODEL")
+    model_provider = "openai"
+    # 关闭思维链：Qwen3.8 默认在 content 里返回思考过程（以 /think 结束标签收尾），
+    # 会污染 RAG 回答正文并大量消耗输出 token；经 ChatOpenAI 的 extra_body 透传给 vLLM。
+    extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
 
 
 class MinIOConfig:
@@ -42,6 +58,21 @@ class EmbeddingConfig:
     bge_device = os.getenv("BGE_DEVICE")
     # 特殊处理：将.env中的1/0转为布尔值，兼容常见的数字/字符串格式
     bge_fp16 = os.getenv("BGE_FP16") in ("1", "True", "true", 1)
+    # 【Colab远程部署改造】远程 BGE-M3 服务地址（TEI 的 /embed_all 或 FastAPI 回退的 /v1/embeddings）
+    bge_m3_url = os.getenv("BGE_M3_URL")
+    # 远程向量/重排后端开关：tei（默认）或 fastapi（回退），embedding 与 rerank 共用
+    embed_backend = os.getenv("EMBED_BACKEND", "tei")
+    # 向量来源开关：remote（默认，现行 HTTP 远程版）| local（本地模型）| colab（Colab 网关）
+    embed_source = os.getenv("EMBED_SOURCE", "remote")
+
+
+class ColabConfig:
+    # Colab 推理栈聚合网关（FastAPI + Cloudflare 隧道）公网地址，如 https://xxx.trycloudflare.com
+    # 隧道重启后地址会变，只改 .env 不改代码
+    colab_base_url = os.getenv("COLAB_BASE_URL", "")
+    colab_timeout = float(os.getenv("COLAB_TIMEOUT", "120"))
+    # PDF 解析是长任务（数百页年报），单独放宽超时（秒）
+    colab_parse_timeout = float(os.getenv("COLAB_PARSE_TIMEOUT", "1800"))
 
 
 class MilvusConfig:
@@ -59,8 +90,23 @@ class MCPConfig:
     mcp_dashscope_base_url = os.getenv("MCP_DASHSCOPE_BASE_URL")
 
 
+class TavilyConfig:
+    # Tavily Search API. Key is read from env only (.env tavily_key, or
+    # standard TAVILY_API_KEY); it must never be logged or hard-coded.
+    api_key = os.getenv("tavily_key") or os.getenv("TAVILY_API_KEY")
+    base_url = os.getenv("TAVILY_BASE_URL", "https://api.tavily.com")
+    search_depth = os.getenv("TAVILY_SEARCH_DEPTH", "basic")
+    max_results = int(os.getenv("TAVILY_MAX_RESULTS", "5") or "5")
+    timeout = float(os.getenv("TAVILY_TIMEOUT", "15") or "15")
+
+
 class ReRankerConfig:
     reranker_base_url = os.getenv("RERANK_BASE_URL")
+    # 【Colab远程部署改造】自托管 Rerank 服务地址（TEI 的 /rerank 或 FastAPI 回退的 /v1/rerank），
+    # 替代原百炼 DashScope 云重排（reranker_tool.py 保留未删，便于回滚）
+    reranker_url = os.getenv("BGE_RERANKER_URL")
+    # 与 EmbeddingConfig 共用同一个后端开关 EMBED_BACKEND
+    embed_backend = os.getenv("EMBED_BACKEND", "tei")
 
 
 class PromptConfig:
@@ -100,7 +146,7 @@ class PromptConfig:
     2. 如果历史会话中同时出现了主体名称和型号，item_names 中必须包含主体名称。可以在主体名称前附带品牌 and/or 型号作为补充信息，格式为"[品牌][型号]主体名称"，例如"hak180烫金机"或"华为Mate60手机"。
     3. 如果用户使用了代词（如"这个"、"它"），请结合历史会话指代消解，确定主体名称。
     4. 如果整个对话中确实没有任何主体名称信息，item_names 返回原始语句某个名词。
-    5. 请重新改写用户的问题（rewritten_query），使其成为包含主体名称的独立完整问题。
+    5. 请重新改写用户的问题（rewritten_query），使其成为包含主体名称的独立完整问题（保持原问题意图，切勿擅自更改询问维度或将人员/数据查询曲解为“有哪些人名”）。
     6. 可能有一个或多个主体，但不能重复。
     """
 

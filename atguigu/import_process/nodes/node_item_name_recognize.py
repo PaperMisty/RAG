@@ -2,13 +2,15 @@
 from atguigu.config.config import PromptConfig
 from pymilvus import MilvusClient
 from atguigu.config.config import MilvusConfig
-from atguigu.tool.bgem3_client_tool import get_bgem3_embedding
+# 向量化走统一分发 bgem3_tool（按 EMBED_SOURCE 选 local/remote/colab，与 node_bge_embedding 一致）；
+# 原写死 bgem3_http_tool 远程版，EMBED_SOURCE=local 的本地入库路径下主体向量无处可取，故改走分发。
+from atguigu.tool.bgem3_tool import get_bgem3_embedding
 from pymilvus import CollectionSchema
 from pymilvus import DataType
 from atguigu.tool.milvus_client_tool import get_milvus_client
 from langchain.chat_models import init_chat_model
 import os
-from atguigu.config.config import LLMConfig
+from atguigu.config.config import LLMConfig, TextLLMConfig  # 【Colab远程部署改造】文本模型走网关配置
 from atguigu.tool.validate_path import validate_path
 from atguigu.tool.logger import logger
 from atguigu.tool.json_format_tool import json_format
@@ -69,10 +71,11 @@ class NodeItemNameRecognition(NodeBase):
         content_example = json.dumps(chunks[:10], ensure_ascii=False)[:MAX_LENGTH]
 
         llm = init_chat_model(
-            model=LLMConfig.item_model,
+            model=TextLLMConfig.default_model,
             model_provider="openai",
-            base_url=LLMConfig.base_url,
-            api_key=LLMConfig.api_key,
+            base_url=TextLLMConfig.base_url,
+            api_key=TextLLMConfig.api_key,
+            extra_body=TextLLMConfig.extra_body,
             temperature=LLMConfig.temperature,
         )
         msg = [

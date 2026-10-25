@@ -8,7 +8,9 @@
 from atguigu.tool.task_utils import add_done_task
 from atguigu.tool.task_utils import get_task_info
 from atguigu.tool.task_utils import add_running_task
+from atguigu.tool.task_utils import add_node_duration
 from abc import abstractmethod, ABC
+import time
 
 from atguigu.query_process.state import QueryGraphState
 from atguigu.tool.logger import logger
@@ -29,23 +31,36 @@ class NodeBase(ABC):
         """
         节点执行入口
         """
+        # Task/session are logged on every node line: without them,
+        # concurrent queries interleave in one log file and no line
+        # can be attributed to the query the user is staring at.
+        task_id = state.get("task_id")
+        session_id = state.get("session_id")
+        ctx = f"task={task_id} session={session_id}"
+        started = time.time()
         try:
-            logger.info(f"[{self.name}] 开始执行...")
+            logger.info(f"[{self.name}] 开始执行... {ctx}")
             q = state.get("q")
-            task_id = state.get("task_id")
             add_running_task(task_id, self.name)
-            q.put({"event": "progress", "data": get_task_info(task_id)})
+            if q is not None:
+                q.put({"event": "progress", "data": get_task_info(task_id)})
 
             result = self.process(state)
 
+            elapsed = time.time() - started
+            add_node_duration(task_id, self.name, elapsed)
             add_done_task(task_id, self.name)
-            q.put({"event": "progress", "data": get_task_info(task_id)})
+            if q is not None:
+                q.put({"event": "progress", "data": get_task_info(task_id)})
 
-            logger.info(f"[{self.name}] 结束执行...")
+            logger.info(f"[{self.name}] 结束执行... {ctx} elapsed={elapsed:.1f}s")
 
             return result
         except Exception as e:
-            logger.error(f"[{self.name}] 执行失败: {e}")
+            logger.error(
+                f"[{self.name}] 执行失败: {ctx} elapsed={time.time() - started:.1f}s "
+                f"error_type={type(e).__name__} error={str(e)[:500]}"
+            )
             raise
 
     @abstractmethod

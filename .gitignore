@@ -8,7 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
-
+.*
 # Environment variables
 .env
 .vscode
@@ -18,7 +18,19 @@ wheels/
 
 # Data
 data/
-
+atguigu/data/
+**/data/
+*.zip
+*.tar.gz
+out_charts/
 test/
 experiment
 .colab
+.*
+
+# Deploy volumes
+deploy/volumes/
+# Service logs (persistent, rotated, never committed)
+logs/
+# Observer runtime traces
+observer/traces/

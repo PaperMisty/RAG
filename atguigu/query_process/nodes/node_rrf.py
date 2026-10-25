@@ -4,6 +4,8 @@ from atguigu.tool.json_format_tool import json_format
 from atguigu.query_process.base import NodeBase
 from atguigu.query_process.state import QueryGraphState
 from atguigu.tool.logger import logger
+from observer.collector import trace_collector
+import time
 
 
 class NodeRrf(NodeBase):
@@ -21,16 +23,26 @@ class NodeRrf(NodeBase):
         :param state: 工作流状态对象
         :return: 更新后的状态对象
         """
+        task_id = state.get("task_id") or ""
+        t_start = time.perf_counter()
 
         hyde_embedding_chunks = state.get("hyde_embedding_chunks", "")
         embedding_chunks = state.get("embedding_chunks", "")
+        dense_chunks = state.get("dense_chunks") or []
+        sparse_chunks = state.get("sparse_chunks") or []
         if not hyde_embedding_chunks or not embedding_chunks:
             logger.error(f"没有召回结果: {embedding_chunks=},{hyde_embedding_chunks=}")
             raise ValueError(f"没有召回结果: {embedding_chunks=},{hyde_embedding_chunks=}")
 
         RRF_SMOOTH = 60
+        RRF_TOP_K = 10
         rrf_dict = {}  # 用 dict 代替列表，实现 O(1) 复杂度的去重与定位
-        rrf_weight = [(embedding_chunks, 1), (hyde_embedding_chunks, 1)]
+        # 对 Re-Query 混合检索与 HyDE 混合检索进行 1:1 倒排融合，同时将未进混合前10的 Dense/Sparse 尾部候补纳入展示
+        rrf_weight = [(embedding_chunks, 1.0), (hyde_embedding_chunks, 1.0)]
+        if dense_chunks:
+            rrf_weight.append((dense_chunks, 0.3))
+        if sparse_chunks:
+            rrf_weight.append((sparse_chunks, 0.3))
 
         for embedding, weight in rrf_weight:
             for rank, chunk in enumerate(embedding, 1):
@@ -51,7 +63,18 @@ class NodeRrf(NodeBase):
                     rrf_dict[chunk_id]["score_rrf"] += score_rrf
 
         # 按得分排序，并转回列表结构
-        rrf_chunks = sorted(rrf_dict.values(), key=lambda x: x["score_rrf"], reverse=True)
+        rrf_all_chunks = sorted(rrf_dict.values(), key=lambda x: x["score_rrf"], reverse=True)
+        for rank_idx, item in enumerate(rrf_all_chunks, 1):
+            item["rrf_rank"] = rank_idx
+
+        elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
+        if task_id:
+            trace_collector.add_io_item(task_id, "rrf", "RRF 倒排融合 CPU 计算", elapsed_ms, io_type="cpu")
+            trace_collector.set_module_total_ms(task_id, "rrf", elapsed_ms)
+            trace_collector.record_rrf(task_id, rrf_all_chunks, top_k=RRF_TOP_K, rrf_smooth=RRF_SMOOTH)
+
+        # 截取 Top-K 传递给下游重排（若未超 Top-K 则全量传递）
+        rrf_chunks = rrf_all_chunks[:RRF_TOP_K]
 
         return {"rrf_chunks": rrf_chunks}
 

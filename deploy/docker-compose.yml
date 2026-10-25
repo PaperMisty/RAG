@@ -1,0 +1,153 @@
+
+# ==============================================================================
+# RAG 基础架构组件编排 (Milvus, MinIO, etcd, MongoDB, Attu 可视化面板)
+# 适用环境: WSL2 / 本地单机生产仿真环境
+# ==============================================================================
+
+networks:
+  rag-net:
+    driver: bridge
+
+services:
+  # --------------------------------------------------------------------------
+  # 1. etcd: Milvus 元数据存储与服务注册
+  # --------------------------------------------------------------------------
+  etcd:
+    container_name: rag-milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    restart: unless-stopped
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ./volumes/etcd:/etcd
+    command: >
+      etcd 
+      -advertise-client-urls=http://127.0.0.1:2379 
+      -listen-client-urls=http://0.0.0.0:2379 
+      --data-dir=/etcd
+    networks:
+      - rag-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # --------------------------------------------------------------------------
+  # 2. MinIO: Milvus 向量底层存储 & RAG 多模态图片对象存储
+  # --------------------------------------------------------------------------
+  minio:
+    container_name: rag-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    restart: unless-stopped
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - ./volumes/minio:/minio_data
+    ports:
+      - "9000:9000"   # API 端点 (业务代码对接)
+      - "9001:9001"   # 控制台 Web 管理界面 (浏览器访问)
+    command: minio server /minio_data --console-address ":9001"
+    networks:
+      - rag-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # --------------------------------------------------------------------------
+  # 3. Milvus: 核心向量数据库 (Standalone 单机版)
+  # --------------------------------------------------------------------------
+  standalone:
+    container_name: rag-milvus-standalone
+    image: milvusdb/milvus:v2.4.13
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - ./volumes/milvus:/var/lib/milvus
+    ports:
+      - "19530:19530" # gRPC / SDK 默认端口
+      - "9091:9091"   # Prometheus / 健康检查指标
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - rag-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # --------------------------------------------------------------------------
+  # 4. Attu: Milvus 官方可视化管理面板 (Web GUI)
+  # --------------------------------------------------------------------------
+  attu:
+    container_name: rag-milvus-attu
+    image: zilliz/attu:v2.4
+    restart: unless-stopped
+    environment:
+      MILVUS_URL: standalone:19530
+    ports:
+      - "8000:3000" # 浏览器访问 http://localhost:8000 即可直接查看向量库与切片
+    depends_on:
+      standalone:
+        condition: service_healthy
+    networks:
+      - rag-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "2"
+
+  # --------------------------------------------------------------------------
+  # 5. MongoDB: 多轮对话上下文与历史存储
+  # --------------------------------------------------------------------------
+  mongodb:
+    container_name: rag-mongodb
+    image: mongo:7.0
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./volumes/mongodb:/data/db
+    networks:
+      - rag-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand('ping').ok", "--quiet"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"

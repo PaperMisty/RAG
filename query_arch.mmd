@@ -1,0 +1,93 @@
+---
+config:
+  theme: base
+  themeVariables:
+    fontFamily: "TimesNewRoman"
+    fontSize: "22px"
+    primaryBorderColor: "#0062ffff"
+---
+flowchart LR
+    subgraph S_Input ["输入与意图识别 (node_item_name_confirm)"]
+        direction TD
+        N_Start(["开始: 用户提问"])
+        N_Intent("LLM 意图改写与主体抽取<br/>rewritten_query &amp; item_names")
+        N_Align("Milvus 层次对齐商品名<br/>置信度判定")
+        N_Start --> N_Intent --> N_Align
+    end
+
+    subgraph S_Router ["路由分发决策 (after_item_name_confirm_router)"]
+        direction TD
+        R_Mid("中置信度: 存在多个歧义候选")
+        R_Low("低置信度: 未匹配到本地主体")
+        R_High("高置信度: 成功锁定本地主体")
+    end
+
+    subgraph S_LowConf ["低置信度链路 (联网搜索与重排)"]
+        direction TD
+        N_WebSearch("Tavily MCP 联网检索<br/>(node_web_search_mcp)")
+        N_Rerank("Cross-Encoder 重排与断崖截断<br/>(node_rerank)")
+        N_WebSearch --> N_Rerank
+    end
+
+    subgraph S_HighConf ["高置信度链路 (纯本地双路混合检索与RRF融合)"]
+        direction TD
+        subgraph Sub_ReQuery ["分支 A: Re-Query 混合检索"]
+            direction TD
+            RQ_Milvus("BGE-M3 双路向量化<br/>+ Milvus 标量过滤混合检索<br/>(node_search_embedding)")
+        end
+
+        subgraph Sub_HyDE ["分支 B: HyDE 假设性问答检索"]
+            direction TD
+            HyDE_Gen("LLM 生成假设性答案")
+            HyDE_Milvus("BGE-M3 向量化<br/>+ Milvus 标量过滤混合检索<br/>(node_search_embedding_hyde)")
+            HyDE_Gen --> HyDE_Milvus
+        end
+
+        subgraph Sub_RRF ["倒排排名融合与重排 (node_rrf &amp; node_rerank)"]
+            direction TD
+            RRF_Exec("RRF 倒排加权融合<br/>Score = ∑ w / (rank + 60)<br/>截取 Top 10 切片")
+            Rerank_Exec("Cross-Encoder 重排与断崖截断<br/>(node_rerank)")
+            RRF_Exec --> Rerank_Exec
+        end
+
+        Sub_ReQuery --> Sub_RRF
+        Sub_HyDE --> Sub_RRF
+    end
+
+    subgraph S_Output ["答案输出与落库 (node_answer_output)"]
+        direction TD
+        N_Clarify("输出主体澄清提问话术")
+        N_WebAnswer("基于重排联网摘要<br/>LLM 流式生成回答")
+        N_RagAnswer("基于 RRF 本地切片<br/>LLM 流式生成 RAG 回答")
+        N_SaveMongo("存储问答记录至 MongoDB")
+        N_End(["结束: 完成响应"])
+
+        N_Clarify --> N_SaveMongo
+        N_WebAnswer --> N_SaveMongo
+        N_RagAnswer --> N_SaveMongo
+        N_SaveMongo --> N_End
+    end
+
+    %% 跨模块路由连线
+    N_Align --> R_Mid
+    N_Align --> R_Low
+    N_Align --> R_High
+
+    R_Mid --> N_Clarify
+    R_Low --> N_WebSearch
+    R_High --> RQ_Milvus
+    R_High --> HyDE_Gen
+
+    N_Rerank --> N_WebAnswer
+    Sub_RRF --> N_RagAnswer
+
+    %% 样式统一定义与绑定
+    classDef startEnd fill:#E3F2FD,stroke:#1565C0,stroke-width:2px;
+    classDef routerNode fill:#FFF3E0,stroke:#E65100,stroke-width:1.5px;
+    classDef processNode fill:#F3E5F5,stroke:#8E24AA,stroke-width:1.5px;
+    classDef retrievalNode fill:#E8F5E9,stroke:#2E7D32,stroke-width:1.5px;
+
+    class N_Start,N_End startEnd;
+    class R_Mid,R_Low,R_High routerNode;
+    class N_Intent,N_Align,N_Clarify,N_WebAnswer,N_RagAnswer,N_SaveMongo processNode;
+    class N_WebSearch,N_Rerank,RQ_Milvus,HyDE_Gen,HyDE_Milvus,RRF_Exec,Rerank_Exec retrievalNode;
